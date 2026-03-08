@@ -1,0 +1,2 @@
+# Daily at 03:30
+30 3 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1

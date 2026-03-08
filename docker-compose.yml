@@ -1,0 +1,77 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: worktool-backend
+    restart: unless-stopped
+    environment:
+      PYTHONUNBUFFERED: ${PYTHONUNBUFFERED:-1}
+      APP_DB_PATH: ${APP_DB_PATH:-/data/app.db}
+      ENABLE_TROUBLESHOOT: ${ENABLE_TROUBLESHOOT:-false}
+      DB_HOST: ${DB_HOST:-}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_NAME: ${DB_NAME:-}
+    volumes:
+      - db_data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+    networks:
+      - worktool-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: worktool-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+    networks:
+      - worktool-net
+
+  db-backup:
+    build:
+      context: .
+      dockerfile: docker/backup/Dockerfile
+    container_name: worktool-db-backup
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DB_FILE: ${DB_FILE:-/data/app.db}
+      BACKUP_DIR: ${BACKUP_DIR:-/backup}
+      RETENTION_DAYS: ${RETENTION_DAYS:-7}
+    volumes:
+      - db_data:/data:ro
+      - db_backup:/backup
+    depends_on:
+      - backend
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+    networks:
+      - worktool-net
+
+networks:
+  worktool-net:
+    driver: bridge
+
+volumes:
+  db_data:
+    name: worktool_db_data
+  db_backup:
+    name: worktool_db_backup

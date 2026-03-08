@@ -1,0 +1,83 @@
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.brand {
+  color: #fff;
+  font-weight: 600;
+  font-size: 16px;
+  padding: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.topbar {
+  background: #fff;
+  border-bottom: 1px solid #eaeaea;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+}
+
+.content-wrap {
+  margin: 16px;
+}
+
+.robot-info-matrix {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.robot-info-matrix th,
+.robot-info-matrix td {
+  border: 1px solid #d9d9d9;
+  padding: 12px;
+  font-size: 15px;
+}
+
+.robot-info-matrix th {
+  width: 15%;
+  color: #666;
+  background: #fafafa;
+  font-weight: 500;
+  text-align: left;
+}
+
+.robot-info-matrix td {
+  width: 18.33%;
+}
+
+.robot-callback-config {
+  border-top: 2px solid #e6f4ff;
+}
+
+.callback-title {
+  font-size: 24px;
+  color: #1677ff;
+  margin-bottom: 8px;
+}
+
+.callback-form-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.callback-form-row label {
+  color: #444;
+}
+
+.callback-form-row .required {
+  color: #ff4d4f;
+}
+
+.callback-action-row {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

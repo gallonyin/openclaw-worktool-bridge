@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime / data
+backend/app.db
+backend/*.db
+*.log
+logs/
+*.pid
+*.sqlite3
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Build/cache
+tmp/
+.cache/
+
+# TypeScript build cache
+frontend/*.tsbuildinfo
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Local backup artifacts
+backup/sqlite/
