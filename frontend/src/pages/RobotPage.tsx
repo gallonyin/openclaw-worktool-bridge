@@ -3,8 +3,9 @@ import { ArrowDownOutlined, ArrowUpOutlined } from '@ant-design/icons';
 import { Button, Card, Collapse, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import type { Provider, Robot, Rule } from '../types';
+import type { Provider, Rule } from '../types';
 import { SELECTED_ROBOT_STORAGE_KEY } from '../constants';
+import { loadLocalRobots, removeLocalRobot, upsertLocalRobot, type LocalRobotItem } from '../localRobotStore';
 
 interface CallbackBaseSuggestions {
   current_request_base?: string;
@@ -15,7 +16,8 @@ interface CallbackBaseSuggestions {
 
 export default function RobotPage() {
   const navigate = useNavigate();
-  const [items, setItems] = useState<Robot[]>([]);
+  const [items, setItems] = useState<LocalRobotItem[]>(() => loadLocalRobots());
+  const [localRobotIdInput, setLocalRobotIdInput] = useState('');
   const [selectedRobotId, setSelectedRobotId] = useState<string | undefined>(() => {
     try {
       return localStorage.getItem(SELECTED_ROBOT_STORAGE_KEY) || undefined;
@@ -28,7 +30,7 @@ export default function RobotPage() {
   const [ruleScene, setRuleScene] = useState<'group' | 'private'>('group');
 
   const [robotOpen, setRobotOpen] = useState(false);
-  const [editingRobot, setEditingRobot] = useState<Robot | null>(null);
+  const [editingRobotId, setEditingRobotId] = useState<string | null>(null);
   const [robotForm] = Form.useForm();
 
   const [ruleOpen, setRuleOpen] = useState(false);
@@ -41,22 +43,12 @@ export default function RobotPage() {
   const [callbackExampleUrl, setCallbackExampleUrl] = useState('');
   const [callbackBaseSuggestions, setCallbackBaseSuggestions] = useState<CallbackBaseSuggestions>({});
 
-  const loadRobots = async () => {
-    const res = await api.listRobots();
-    setItems(res);
-    if (res.length === 0) {
-      setSelectedRobotId(undefined);
+  const loadRulesAndProviders = async (robotId?: string) => {
+    if (!robotId) {
+      setRules([]);
+      setProviders([]);
       return;
     }
-    const current = selectedRobotId;
-    const exists = current && res.some((x: Robot) => x.robot_id === current);
-    if (!exists) {
-      setSelectedRobotId(res[0].robot_id);
-    }
-  };
-
-  const loadRulesAndProviders = async (robotId?: string) => {
-    if (!robotId) return;
     const [ruleRes, providerRes] = await Promise.all([api.listRules(robotId), api.listProviders(robotId)]);
     setRules(ruleRes);
     setProviders(providerRes);
@@ -70,22 +62,45 @@ export default function RobotPage() {
       auto_bind_message_callback_on_create: res.auto_bind_message_callback_on_create !== false
     });
     setCallbackExampleUrl(res.callback_example_url || '');
+    return res;
   };
 
   const loadCallbackBaseSuggestions = async () => {
     try {
       const res = await api.getCallbackBaseSuggestions();
       setCallbackBaseSuggestions(res || {});
+      return res || {};
     } catch {
       setCallbackBaseSuggestions({});
+      return {};
     }
   };
 
   useEffect(() => {
-    void loadRobots();
-    void loadWorktoolSettings();
-    void loadCallbackBaseSuggestions();
+    const init = async () => {
+      const [settings, suggestions] = await Promise.all([
+        loadWorktoolSettings(),
+        loadCallbackBaseSuggestions()
+      ]);
+      const current = (settings?.callback_public_base_url || '').trim();
+      const suggested = (suggestions?.suggested_base || '').trim();
+      if (!current && suggested) {
+        worktoolForm.setFieldValue('callback_public_base_url', suggested);
+      }
+    };
+    void init();
   }, []);
+
+  useEffect(() => {
+    if (items.length === 0) {
+      setSelectedRobotId(undefined);
+      return;
+    }
+    const current = selectedRobotId;
+    if (!current || !items.some((x) => x.robot_id === current)) {
+      setSelectedRobotId(items[0].robot_id);
+    }
+  }, [items, selectedRobotId]);
 
   useEffect(() => {
     void loadRulesAndProviders(selectedRobotId);
@@ -106,7 +121,7 @@ export default function RobotPage() {
     [providers]
   );
   const robotOptions = useMemo(
-    () => items.map((r) => ({ label: `${r.name} (${r.robot_id})`, value: r.robot_id })),
+    () => items.map((r) => ({ label: r.name ? `${r.name} (${r.robot_id})` : r.robot_id, value: r.robot_id })),
     [items]
   );
 
@@ -128,7 +143,7 @@ export default function RobotPage() {
   };
 
   const onCreateRobot = () => {
-    setEditingRobot(null);
+    setEditingRobotId(null);
     robotForm.resetFields();
     robotForm.setFieldsValue({
       name: '机器人',
@@ -139,42 +154,92 @@ export default function RobotPage() {
     setRobotOpen(true);
   };
 
-  const onEditRobot = (row: Robot) => {
-    setEditingRobot(row);
-    robotForm.setFieldsValue(row);
-    setRobotOpen(true);
+  const onEditRobot = async (robotId: string) => {
+    try {
+      const res = await api.getRobot(robotId);
+      setEditingRobotId(robotId);
+      robotForm.resetFields();
+      robotForm.setFieldsValue({
+        robot_id: robotId,
+        name: res?.name || '',
+        group_default_reply: res?.defaults?.group || '',
+        private_default_reply: res?.defaults?.private || '',
+        group_chat_enabled: res?.group_chat_enabled !== false,
+        private_chat_enabled: res?.private_chat_enabled !== false,
+        group_reply_only_when_mentioned: !!res?.group_reply_only_when_mentioned
+      });
+      setRobotOpen(true);
+    } catch (e: any) {
+      Modal.error({
+        title: '读取机器人失败',
+        content: e?.response?.data?.detail || e?.message || '未知错误',
+      });
+    }
   };
 
-  const onDeleteRobot = async (row: Robot) => {
+  const onDeleteRobot = async (row: LocalRobotItem) => {
     await api.deleteRobot(row.robot_id);
     message.success('机器人已删除');
+    const next = removeLocalRobot(row.robot_id);
+    setItems(next);
     if (selectedRobotId === row.robot_id) {
       setSelectedRobotId(undefined);
       setRules([]);
     }
-    await loadRobots();
+  };
+
+  const onRemoveLocalRobot = (row: LocalRobotItem) => {
+    const next = removeLocalRobot(row.robot_id);
+    setItems(next);
+    if (selectedRobotId === row.robot_id) {
+      setSelectedRobotId(undefined);
+      setRules([]);
+    }
+    message.success('已从本地列表移除');
+  };
+
+  const onAddLocalRobot = () => {
+    const robotId = localRobotIdInput.trim();
+    if (!robotId) {
+      message.warning('请输入 Robot ID');
+      return;
+    }
+    const next = upsertLocalRobot({ robot_id: robotId });
+    setItems(next);
+    setSelectedRobotId(robotId);
+    setLocalRobotIdInput('');
+    message.success('已加入本地机器人列表');
   };
 
   const submitRobot = async () => {
     const values = await robotForm.validateFields();
     try {
-      if (editingRobot) {
-        await api.updateRobot(editingRobot.robot_id, values);
+      if (editingRobotId) {
+        await api.updateRobot(editingRobotId, values);
+        const next = upsertLocalRobot({
+          robot_id: editingRobotId,
+          name: (values.name || '').trim() || undefined
+        });
+        setItems(next);
         message.success('机器人更新成功');
       } else {
         values.name = (values.name || '').trim() || '机器人';
         const res = await api.createRobot(values);
-        if (res?.auto_bind_message_callback && res?.callback_url) {
+        const next = upsertLocalRobot({ robot_id: values.robot_id, name: values.name });
+        setItems(next);
+        setSelectedRobotId(values.robot_id);
+        if (res?.existed) {
+          message.success('机器人已存在，已加入本地列表');
+        } else if (res?.auto_bind_message_callback && res?.callback_url) {
           message.success(`机器人创建成功，已自动绑定消息回调：${res.callback_url}`);
         } else {
           message.success('机器人创建成功');
         }
       }
       setRobotOpen(false);
-      await loadRobots();
     } catch (e: any) {
       Modal.error({
-        title: editingRobot ? '更新失败' : '创建失败',
+        title: editingRobotId ? '更新失败' : '创建失败',
         content: e?.response?.data?.detail || e?.message || '未知错误',
       });
     }
@@ -323,37 +388,55 @@ export default function RobotPage() {
               key: 'robot-list',
               label: `机器人列表（当前：${selectedRobotId || '-'}）`,
               children: (
-                <Table
-                  rowKey="robot_id"
-                  dataSource={items}
-                  pagination={false}
-                  columns={[
-                    { title: 'Robot ID', dataIndex: 'robot_id' },
-                    { title: '名称', dataIndex: 'name' },
-                    { title: '群聊', dataIndex: 'group_chat_enabled', render: (v) => (v ? '开' : '关') },
-                    { title: '私聊', dataIndex: 'private_chat_enabled', render: (v) => (v ? '开' : '关') },
-                    { title: '仅@回复', dataIndex: 'group_reply_only_when_mentioned', render: (v) => (v ? '是' : '否') },
-                    {
-                      title: '操作',
-                      render: (_, row: Robot) => (
-                        <Space>
-                          <Button size="small" onClick={() => setSelectedRobotId(row.robot_id)}>选择</Button>
-                          <Button size="small" onClick={() => onEditRobot(row)}>编辑</Button>
-                          <Popconfirm
-                            title="确认删除该机器人？"
-                            description={`robot_id: ${row.robot_id}`}
-                            okText="删除"
-                            cancelText="取消"
-                            okButtonProps={{ danger: true }}
-                            onConfirm={() => void onDeleteRobot(row)}
-                          >
-                            <Button size="small" danger>删除</Button>
-                          </Popconfirm>
-                        </Space>
-                      )
-                    }
-                  ]}
-                />
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  <Space wrap>
+                    <Input
+                      style={{ width: 320 }}
+                      placeholder="手动添加 Robot ID 到本地列表"
+                      value={localRobotIdInput}
+                      onChange={(e) => setLocalRobotIdInput(e.target.value)}
+                      onPressEnter={onAddLocalRobot}
+                    />
+                    <Button onClick={onAddLocalRobot}>添加到本地</Button>
+                  </Space>
+                  <Table
+                    rowKey="robot_id"
+                    dataSource={items}
+                    pagination={false}
+                    columns={[
+                      { title: 'Robot ID', dataIndex: 'robot_id' },
+                      { title: '名称', dataIndex: 'name', render: (v: string) => v || '-' },
+                      {
+                        title: '操作',
+                        render: (_, row: LocalRobotItem) => (
+                          <Space>
+                            <Button size="small" onClick={() => setSelectedRobotId(row.robot_id)}>选择</Button>
+                            <Button size="small" onClick={() => void onEditRobot(row.robot_id)}>编辑</Button>
+                            <Popconfirm
+                              title="确认删除该机器人？"
+                              description={`robot_id: ${row.robot_id}`}
+                              okText="删除"
+                              cancelText="取消"
+                              okButtonProps={{ danger: true }}
+                              onConfirm={() => void onDeleteRobot(row)}
+                            >
+                              <Button size="small" danger>删后端</Button>
+                            </Popconfirm>
+                            <Popconfirm
+                              title="仅从当前浏览器本地列表移除？"
+                              description={`robot_id: ${row.robot_id}`}
+                              okText="移除"
+                              cancelText="取消"
+                              onConfirm={() => onRemoveLocalRobot(row)}
+                            >
+                              <Button size="small">仅本地移除</Button>
+                            </Popconfirm>
+                          </Space>
+                        )
+                      }
+                    ]}
+                  />
+                </Space>
               )
             }
           ]}
@@ -430,7 +513,7 @@ export default function RobotPage() {
       </Card>
 
       <Modal
-        title={editingRobot ? '编辑机器人' : '新建机器人'}
+        title={editingRobotId ? '编辑机器人' : '新建机器人'}
         open={robotOpen}
         onCancel={() => setRobotOpen(false)}
         onOk={submitRobot}
@@ -439,7 +522,7 @@ export default function RobotPage() {
       >
         <Form form={robotForm} layout="vertical">
           <Form.Item name="robot_id" label="Robot ID" rules={[{ required: true }]}>
-            <Input disabled={!!editingRobot} />
+            <Input disabled={!!editingRobotId} />
           </Form.Item>
           <Form.Item name="name" label="名称（选填）">
             <Input />
@@ -474,7 +557,7 @@ export default function RobotPage() {
       >
         <Form form={ruleForm} layout="vertical">
           <Form.Item name="robot_id" label="Robot ID" rules={[{ required: true }]}>
-            <Select options={items.map((r) => ({ label: `${r.name} (${r.robot_id})`, value: r.robot_id }))} />
+            <Select options={robotOptions} />
           </Form.Item>
           <Form.Item name="scene" label="场景" rules={[{ required: true }]}>
             <Select

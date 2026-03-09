@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Button, Card, Input, Select, Space, Table, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
-import type { Robot } from '../types';
 import { SELECTED_ROBOT_STORAGE_KEY } from '../constants';
+import { loadLocalRobots, type LocalRobotItem } from '../localRobotStore';
 
 interface QaLogItem {
   robotId: string;
@@ -30,7 +30,7 @@ const roomTypeMap: Record<number, string> = {
 };
 
 export default function MessageLogPage() {
-  const [robots, setRobots] = useState<Robot[]>([]);
+  const [robots, setRobots] = useState<LocalRobotItem[]>(() => loadLocalRobots());
   const [robotId, setRobotId] = useState<string | undefined>(() => {
     try {
       return localStorage.getItem(SELECTED_ROBOT_STORAGE_KEY) || undefined;
@@ -46,19 +46,19 @@ export default function MessageLogPage() {
   const [total, setTotal] = useState(0);
 
   const robotOptions = useMemo(
-    () => robots.map((r) => ({ label: `${r.name} (${r.robot_id})`, value: r.robot_id })),
+    () => robots.map((r) => ({ label: r.name ? `${r.name} (${r.robot_id})` : r.robot_id, value: r.robot_id })),
     [robots]
   );
 
   const loadRobots = async () => {
-    const items = await api.listRobots();
+    const items = loadLocalRobots();
     setRobots(items);
     if (items.length === 0) {
       setRobotId(undefined);
       return;
     }
     const current = robotId;
-    const exists = current && items.some((x: Robot) => x.robot_id === current);
+    const exists = current && items.some((x) => x.robot_id === current);
     if (!exists) {
       setRobotId(items[0].robot_id);
     }

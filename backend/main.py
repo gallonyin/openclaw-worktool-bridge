@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ APP_VERSION = "3.0.0"
 WORKTOOL_API_BASE_DEFAULT = "https://api.worktool.ymdyes.cn"
 DEFAULT_MESSAGE_API_URL = f"{WORKTOOL_API_BASE_DEFAULT}/wework/sendRawMessage"
 ENABLE_TROUBLESHOOT = os.getenv("ENABLE_TROUBLESHOOT", "false").lower() in {"1", "true", "yes", "on"}
+ENABLE_ROBOT_CREATE = os.getenv("ENABLE_ROBOT_CREATE", "false").lower() in {"1", "true", "yes", "on"}
 
 
 def now_iso() -> str:
@@ -525,6 +527,77 @@ def _detect_local_ips() -> List[str]:
     except Exception:
         pass
     return sorted(ips)
+
+
+def _split_host_port(host: str) -> Tuple[str, str]:
+    raw = (host or "").strip()
+    if not raw:
+        return "", ""
+    if raw.startswith("["):
+        # IPv6 host in RFC 2732 form, e.g. [2001:db8::1]:8080
+        right = raw.find("]")
+        if right > 0:
+            host_part = raw[1:right]
+            rest = raw[right + 1 :]
+            if rest.startswith(":"):
+                return host_part, rest[1:]
+            return host_part, ""
+    if raw.count(":") == 1:
+        host_part, maybe_port = raw.rsplit(":", 1)
+        if maybe_port.isdigit():
+            return host_part, maybe_port
+    return raw, ""
+
+
+def _is_domain_host(host: str) -> bool:
+    value = (host or "").strip().lower()
+    if not value or value == "localhost":
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return False
+    except ValueError:
+        return True
+
+
+def _is_global_ip_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address((host or "").strip()).is_global
+    except ValueError:
+        return False
+
+
+def _first_forwarded_value(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    return raw.split(",", 1)[0].strip()
+
+
+def _detect_request_scheme(request: Request) -> str:
+    # Try common reverse-proxy headers first, then fall back to ASGI scheme.
+    candidates = [
+        request.headers.get("x-forwarded-proto"),
+        request.headers.get("x-forwarded-scheme"),
+        request.headers.get("x-scheme"),
+    ]
+    for item in candidates:
+        first = _first_forwarded_value(item or "").lower()
+        if first in {"http", "https"}:
+            return first
+    # Cloudflare may send JSON like {"scheme":"https"} in CF-Visitor.
+    cf_visitor = (request.headers.get("cf-visitor") or "").strip().lower()
+    if '"scheme":"https"' in cf_visitor:
+        return "https"
+    if '"scheme":"http"' in cf_visitor:
+        return "http"
+    return request.url.scheme or "http"
+
+
+def _detect_request_host(request: Request) -> str:
+    forwarded_host = _first_forwarded_value(request.headers.get("x-forwarded-host") or "")
+    host_header = _first_forwarded_value(request.headers.get("host") or "")
+    return forwarded_host or host_header
 
 
 async def _detect_public_ip() -> str:
@@ -1306,17 +1379,11 @@ async def update_worktool_settings(body: WorkToolSettingsUpdate) -> Dict[str, An
 
 @app.get("/api/v1/settings/callback-base-suggestions")
 async def get_callback_base_suggestions(request: Request) -> Dict[str, Any]:
-    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").strip()
-    forwarded_host = (request.headers.get("x-forwarded-host") or "").strip()
-    host_header = (request.headers.get("host") or "").strip()
-    scheme = forwarded_proto or request.url.scheme or "http"
-    host = forwarded_host or host_header
+    scheme = _detect_request_scheme(request)
+    host = _detect_request_host(request)
     current_request_base = f"{scheme}://{host}" if host else ""
 
-    host_without_port = host.split(":")[0] if host else ""
-    host_port = ""
-    if ":" in host:
-        host_port = host.rsplit(":", 1)[1]
+    host_without_port, host_port = _split_host_port(host)
     if not host_port:
         host_port = "443" if scheme == "https" else "80"
 
@@ -1325,9 +1392,10 @@ async def get_callback_base_suggestions(request: Request) -> Dict[str, Any]:
     local_ips = _detect_local_ips()
     intranet_bases = [f"{scheme}://{ip}:{host_port}" for ip in local_ips]
 
-    is_loopback = host_without_port in {"", "127.0.0.1", "localhost", "0.0.0.0"}
+    current_is_domain = _is_domain_host(host_without_port)
+    current_is_global_ip = _is_global_ip_host(host_without_port)
     suggested_base = ""
-    if current_request_base and not is_loopback:
+    if current_request_base and (current_is_domain or current_is_global_ip):
         suggested_base = current_request_base
     elif public_base:
         suggested_base = public_base
@@ -1517,31 +1585,6 @@ async def dashboard_trends(days: int = Query(default=7, ge=1, le=90)) -> Dict[st
     return {"days": days, "items": items}
 
 
-@app.get("/api/v1/robots")
-async def list_robots() -> Dict[str, Any]:
-    conn = get_conn()
-    rows = conn.execute(
-        """
-        SELECT robot_id, name, private_chat_enabled, group_chat_enabled,
-               group_reply_only_when_mentioned, created_at, updated_at
-        FROM robots
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    conn.close()
-    return {
-        "items": [
-            {
-                **dict(row),
-                "private_chat_enabled": bool(row["private_chat_enabled"]),
-                "group_chat_enabled": bool(row["group_chat_enabled"]),
-                "group_reply_only_when_mentioned": bool(row["group_reply_only_when_mentioned"]),
-            }
-            for row in rows
-        ]
-    }
-
-
 @app.get("/api/v1/robots/{robot_id}")
 async def get_robot(robot_id: str) -> Dict[str, Any]:
     conn = get_conn()
@@ -1564,6 +1607,24 @@ async def get_robot(robot_id: str) -> Dict[str, Any]:
 
 @app.post("/api/v1/robots")
 async def create_robot(body: RobotCreate) -> Dict[str, Any]:
+    if not ENABLE_ROBOT_CREATE:
+        raise HTTPException(status_code=403, detail="未开放创建机器人：请先完成登录体系后再启用")
+    robot_id = (body.robot_id or "").strip()
+    if not robot_id:
+        raise HTTPException(status_code=400, detail="robot_id required")
+
+    exists_conn = get_conn()
+    exists_row = exists_conn.execute("SELECT 1 FROM robots WHERE robot_id = ?", (robot_id,)).fetchone()
+    exists_conn.close()
+    if exists_row:
+        write_audit("attach", "robot", robot_id, "attach existing robot")
+        return {
+            "ok": True,
+            "existed": True,
+            "auto_bind_message_callback": False,
+            "callback_url": "",
+        }
+
     conn = get_conn()
     now = now_iso()
     try:
@@ -1575,7 +1636,7 @@ async def create_robot(body: RobotCreate) -> Dict[str, Any]:
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                body.robot_id,
+                robot_id,
                 (body.name or "机器人").strip() or "机器人",
                 1 if body.private_chat_enabled else 0,
                 1 if body.group_chat_enabled else 0,
@@ -1589,14 +1650,14 @@ async def create_robot(body: RobotCreate) -> Dict[str, Any]:
             INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
             VALUES (?, 'group', ?, ?)
             """,
-            (body.robot_id, body.group_default_reply, now),
+            (robot_id, body.group_default_reply, now),
         )
         conn.execute(
             """
             INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
             VALUES (?, 'private', ?, ?)
             """,
-            (body.robot_id, body.private_default_reply, now),
+            (robot_id, body.private_default_reply, now),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -1605,11 +1666,11 @@ async def create_robot(body: RobotCreate) -> Dict[str, Any]:
     conn.close()
 
     auto_bind = parse_bool(get_setting("auto_bind_message_callback_on_create", "true"), True)
-    callback_url = build_robot_callback_url(body.robot_id)
+    callback_url = build_robot_callback_url(robot_id)
     if auto_bind:
         if not callback_url:
             rollback_conn = get_conn()
-            rollback_conn.execute("DELETE FROM robots WHERE robot_id = ?", (body.robot_id,))
+            rollback_conn.execute("DELETE FROM robots WHERE robot_id = ?", (robot_id,))
             rollback_conn.commit()
             rollback_conn.close()
             raise HTTPException(
@@ -1617,10 +1678,10 @@ async def create_robot(body: RobotCreate) -> Dict[str, Any]:
                 detail="create robot failed: 已回滚。自动绑定消息回调失败：未配置“回调公网基础地址”。",
             )
         try:
-            await bind_message_callback(body.robot_id, callback_url, 1)
+            await bind_message_callback(robot_id, callback_url, 1)
         except HTTPException as e:
             rollback_conn = get_conn()
-            rollback_conn.execute("DELETE FROM robots WHERE robot_id = ?", (body.robot_id,))
+            rollback_conn.execute("DELETE FROM robots WHERE robot_id = ?", (robot_id,))
             rollback_conn.commit()
             rollback_conn.close()
             raise HTTPException(
@@ -1628,9 +1689,10 @@ async def create_robot(body: RobotCreate) -> Dict[str, Any]:
                 detail=f"create robot failed: 已回滚。自动绑定消息回调失败：{e.detail}",
             ) from e
 
-    write_audit("create", "robot", body.robot_id, "create robot")
+    write_audit("create", "robot", robot_id, "create robot")
     return {
         "ok": True,
+        "existed": False,
         "auto_bind_message_callback": auto_bind,
         "callback_url": callback_url if auto_bind else "",
     }

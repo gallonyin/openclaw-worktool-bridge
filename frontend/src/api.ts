@@ -18,6 +18,7 @@ export const api = {
   }) =>
     http.put('/settings/worktool', payload).then((r) => r.data),
   listRobots: () => http.get('/robots').then((r) => r.data.items),
+  getRobot: (robotId: string) => http.get(`/robots/${robotId}`).then((r) => r.data),
   createRobot: (payload: any) => http.post('/robots', payload).then((r) => r.data),
   updateRobot: (robotId: string, payload: any) => http.put(`/robots/${robotId}`, payload).then((r) => r.data),
   deleteRobot: (robotId: string) => http.delete(`/robots/${robotId}`).then((r) => r.data),

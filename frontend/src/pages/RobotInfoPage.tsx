@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Button, Card, Col, Input, Modal, Row, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
-import type { Robot } from '../types';
 import { SELECTED_ROBOT_STORAGE_KEY } from '../constants';
+import { loadLocalRobots, type LocalRobotItem } from '../localRobotStore';
 
 interface CallbackItem {
   type: number;
@@ -51,7 +51,7 @@ function isNotExpired(val?: string) {
 }
 
 export default function RobotInfoPage() {
-  const [robots, setRobots] = useState<Robot[]>([]);
+  const [robots, setRobots] = useState<LocalRobotItem[]>(() => loadLocalRobots());
   const [selectedRobotId, setSelectedRobotId] = useState<string | undefined>(() => {
     try {
       return localStorage.getItem(SELECTED_ROBOT_STORAGE_KEY) || undefined;
@@ -72,7 +72,7 @@ export default function RobotInfoPage() {
   const [deletingType, setDeletingType] = useState<number | null>(null);
 
   const robotOptions = useMemo(
-    () => robots.map((r) => ({ label: `${r.name} (${r.robot_id})`, value: r.robot_id })),
+    () => robots.map((r) => ({ label: r.name ? `${r.name} (${r.robot_id})` : r.robot_id, value: r.robot_id })),
     [robots]
   );
 
@@ -92,14 +92,14 @@ export default function RobotInfoPage() {
   };
 
   const loadBaseRobots = async () => {
-    const items = await api.listRobots();
+    const items = loadLocalRobots();
     setRobots(items);
     if (items.length === 0) {
       setSelectedRobotId(undefined);
       return;
     }
     const current = selectedRobotId;
-    const exists = current && items.some((x: Robot) => x.robot_id === current);
+    const exists = current && items.some((x) => x.robot_id === current);
     if (!exists) {
       setSelectedRobotId(items[0].robot_id);
     }
