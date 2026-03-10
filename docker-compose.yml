@@ -1,22 +1,67 @@
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: worktool-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-worktool_bridge}
+      MYSQL_USER: ${MYSQL_USER:-worktool}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change_me_app}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+    networks:
+      - worktool-net
+
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
     container_name: worktool-backend
+    depends_on:
+      mysql:
+        condition: service_healthy
     restart: unless-stopped
     environment:
       PYTHONUNBUFFERED: ${PYTHONUNBUFFERED:-1}
-      APP_DB_PATH: ${APP_DB_PATH:-/data/app.db}
+      APP_MYSQL_HOST: ${APP_MYSQL_HOST:-}
+      APP_MYSQL_PORT: ${APP_MYSQL_PORT:-3306}
+      APP_MYSQL_USER: ${APP_MYSQL_USER:-}
+      APP_MYSQL_PASSWORD: ${APP_MYSQL_PASSWORD:-}
+      APP_MYSQL_DATABASE: ${APP_MYSQL_DATABASE:-}
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
+      AUTH_JWT_EXPIRE_DAYS: ${AUTH_JWT_EXPIRE_DAYS:-30}
+      AUTH_PBKDF2_ITERATIONS: ${AUTH_PBKDF2_ITERATIONS:-390000}
+      AUTH_SMS_ENABLED: ${AUTH_SMS_ENABLED:-false}
       ENABLE_TROUBLESHOOT: ${ENABLE_TROUBLESHOOT:-false}
-      ENABLE_ROBOT_CREATE: ${ENABLE_ROBOT_CREATE:-true}
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_USER: ${DB_USER:-}
-      DB_PASSWORD: ${DB_PASSWORD:-}
-      DB_NAME: ${DB_NAME:-}
-    volumes:
-      - db_data:/data
+      ENABLE_RUNTIME_WORKTOOL_SETTINGS: ${ENABLE_RUNTIME_WORKTOOL_SETTINGS:-false}
+      WORKTOOL_API_BASE: ${WORKTOOL_API_BASE:-}
+      CALLBACK_PUBLIC_BASE_URL: ${CALLBACK_PUBLIC_BASE_URL:-}
+      ADMIN_PHONE_WHITELIST: ${ADMIN_PHONE_WHITELIST:-}
+      WORKTOOL_DB_HOST: ${WORKTOOL_DB_HOST:-}
+      WORKTOOL_DB_PORT: ${WORKTOOL_DB_PORT:-3306}
+      WORKTOOL_DB_USER: ${WORKTOOL_DB_USER:-}
+      WORKTOOL_DB_PASSWORD: ${WORKTOOL_DB_PASSWORD:-}
+      WORKTOOL_DB_NAME: ${WORKTOOL_DB_NAME:-}
+      SMS_HUARUI_API_URL: ${SMS_HUARUI_API_URL:-}
+      SMS_HUARUI_APPKEY: ${SMS_HUARUI_APPKEY:-}
+      SMS_HUARUI_APPSECRET: ${SMS_HUARUI_APPSECRET:-}
+      SMS_HUARUI_SIGN: ${SMS_HUARUI_SIGN:-【南京亚美达科技】}
+      SMS_CODE_EXPIRE_MINUTES: ${SMS_CODE_EXPIRE_MINUTES:-15}
     logging:
       driver: json-file
       options:
@@ -43,36 +88,10 @@ services:
     networks:
       - worktool-net
 
-  db-backup:
-    build:
-      context: .
-      dockerfile: docker/backup/Dockerfile
-    container_name: worktool-db-backup
-    restart: unless-stopped
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      DB_FILE: ${DB_FILE:-/data/app.db}
-      BACKUP_DIR: ${BACKUP_DIR:-/backup}
-      RETENTION_DAYS: ${RETENTION_DAYS:-7}
-    volumes:
-      - db_data:/data:ro
-      - db_backup:/backup
-    depends_on:
-      - backend
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "7"
-    networks:
-      - worktool-net
-
 networks:
   worktool-net:
     driver: bridge
 
 volumes:
-  db_data:
-    name: worktool_db_data
-  db_backup:
-    name: worktool_db_backup
+  mysql_data:
+    name: worktool_mysql_data

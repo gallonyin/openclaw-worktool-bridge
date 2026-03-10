@@ -6,16 +6,40 @@ html, body, #root {
 }
 
 .brand {
-  color: #fff;
+  color: #2f3b40;
   font-weight: 600;
   font-size: 16px;
-  padding: 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 18px 16px;
+  border-bottom: 1px solid rgba(47, 59, 64, 0.08);
+  letter-spacing: 0.2px;
+}
+
+.app-sider {
+  background: linear-gradient(180deg, #fffdf8 0%, #f7f2e8 100%) !important;
+  border-right: 1px solid rgba(47, 59, 64, 0.08);
+}
+
+.app-menu {
+  background: transparent !important;
+  border-inline-end: none !important;
+  padding-top: 8px;
+}
+
+.app-menu .ant-menu-item {
+  margin: 6px 10px !important;
+  border-radius: 10px !important;
+  color: #52636a !important;
+}
+
+.app-menu .ant-menu-item-selected {
+  background: #e8f0ed !important;
+  color: #2f4b50 !important;
+  font-weight: 600;
 }
 
 .topbar {
-  background: #fff;
-  border-bottom: 1px solid #eaeaea;
+  background: #fffdf8;
+  border-bottom: 1px solid rgba(47, 59, 64, 0.08);
   padding: 0 20px;
   display: flex;
   align-items: center;
@@ -23,6 +47,7 @@ html, body, #root {
 
 .content-wrap {
   margin: 16px;
+  background: #f6f3ed;
 }
 
 .robot-info-matrix {
@@ -80,4 +105,46 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  position: relative;
+  overflow: hidden;
+  background: radial-gradient(circle at 20% 20%, #e6f4ff 0%, #f7fbff 35%, #f1f5f9 100%);
+}
+
+.login-bg-orb {
+  position: absolute;
+  border-radius: 999px;
+  filter: blur(2px);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.login-bg-orb-left {
+  width: 360px;
+  height: 360px;
+  left: -100px;
+  top: -80px;
+  background: radial-gradient(circle at 30% 30%, rgba(22, 119, 255, 0.22), rgba(22, 119, 255, 0));
+}
+
+.login-bg-orb-right {
+  width: 300px;
+  height: 300px;
+  right: -70px;
+  bottom: -60px;
+  background: radial-gradient(circle at 40% 40%, rgba(19, 194, 194, 0.22), rgba(19, 194, 194, 0));
+}
+
+.login-card {
+  width: 460px;
+  max-width: 100%;
+  z-index: 1;
+  border-radius: 16px;
+  box-shadow: 0 18px 46px rgba(15, 23, 42, 0.12);
 }

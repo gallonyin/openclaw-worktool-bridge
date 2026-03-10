@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Card, Form, Input, Modal, Select, Space, Switch, Table, message } from 'antd';
+import { Button, Card, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, message } from 'antd';
 import { api } from '../api';
 import type { Provider } from '../types';
 
@@ -48,15 +48,26 @@ export default function AIHubPage() {
     load();
   };
 
+  const onDeleteProvider = async (row: Provider) => {
+    await api.deleteProvider(row.id);
+    message.success('Provider 已删除');
+    await load();
+  };
+
   return (
     <Card
-      title="API 仓库"
+      title="Provider"
       extra={<Button type="primary" onClick={() => {
         setEditing(null);
         form.resetFields();
         setProviderType('openai');
         setUseCustomOpenaiUrl(false);
-        form.setFieldsValue({ enabled: true, provider_type: 'openai', base_url_preset: OPENAI_BASE_OPTIONS[0].value, base_url: OPENAI_BASE_OPTIONS[0].value });
+        form.setFieldsValue({
+          enabled: true,
+          provider_type: 'openai',
+          base_url_preset: OPENAI_BASE_OPTIONS[0].value,
+          base_url: OPENAI_BASE_OPTIONS[0].value
+        });
         setOpen(true);
       }}>新增 Provider</Button>}
     >
@@ -92,6 +103,16 @@ export default function AIHubPage() {
                   });
                   setOpen(true);
                 }}>编辑</Button>
+                <Popconfirm
+                  title="确认删除该 Provider？"
+                  description={`Provider ID: ${row.id}`}
+                  okText="删除"
+                  cancelText="取消"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => void onDeleteProvider(row)}
+                >
+                  <Button size="small" danger>删除</Button>
+                </Popconfirm>
               </Space>
             )
           }

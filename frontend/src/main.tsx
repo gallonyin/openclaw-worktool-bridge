@@ -6,6 +6,12 @@ import zhCN from 'antd/locale/zh_CN';
 import App from './App';
 import './styles.css';
 
+try {
+  localStorage.removeItem('local_robot_list');
+} catch {
+  // ignore storage errors
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider
@@ -13,9 +19,11 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       theme={{
         algorithm: theme.defaultAlgorithm,
         token: {
-          colorPrimary: '#1677ff',
-          colorBgLayout: '#f5f7fa',
-          borderRadius: 8
+          colorPrimary: '#5f8f98',
+          colorBgLayout: '#f6f3ed',
+          colorBgContainer: '#fffdf8',
+          colorText: '#2f3b40',
+          borderRadius: 10
         }
       }}
     >

@@ -1,36 +1,58 @@
-import asyncio
-import ipaddress
+import hashlib
 import json
 import logging
 import os
 import re
-import socket
-import sqlite3
+import secrets
+import time
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Query, Request
+import jwt
+import pymysql
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-try:
-    import pymysql
-except Exception:  # pragma: no cover
-    pymysql = None
+from worktool_troubleshoot import TroubleshootSearchPayload, run_troubleshoot_search
 
-
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-DB_PATH = Path(os.getenv("APP_DB_PATH", str(BASE_DIR / "app.db")))
-CONFIG_JSON_PATH = PROJECT_ROOT / "config.json"
-
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"
 WORKTOOL_API_BASE_DEFAULT = "https://api.worktool.ymdyes.cn"
 DEFAULT_MESSAGE_API_URL = f"{WORKTOOL_API_BASE_DEFAULT}/wework/sendRawMessage"
-ENABLE_TROUBLESHOOT = os.getenv("ENABLE_TROUBLESHOOT", "false").lower() in {"1", "true", "yes", "on"}
-ENABLE_ROBOT_CREATE = os.getenv("ENABLE_ROBOT_CREATE", "false").lower() in {"1", "true", "yes", "on"}
+
+AUTH_PBKDF2_ITERATIONS = int(os.getenv("AUTH_PBKDF2_ITERATIONS", "390000"))
+AUTH_JWT_SECRET = os.getenv("AUTH_JWT_SECRET", "").strip()
+AUTH_JWT_EXPIRE_DAYS = int(os.getenv("AUTH_JWT_EXPIRE_DAYS", "30"))
+AUTH_SMS_ENABLED = os.getenv("AUTH_SMS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_TROUBLESHOOT = os.getenv("ENABLE_TROUBLESHOOT", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_RUNTIME_WORKTOOL_SETTINGS = os.getenv("ENABLE_RUNTIME_WORKTOOL_SETTINGS", "false").strip().lower() in {"1", "true", "yes", "on"}
+WORKTOOL_API_BASE_FIXED_RAW = os.getenv("WORKTOOL_API_BASE", "").strip()
+CALLBACK_PUBLIC_BASE_URL_FIXED_RAW = os.getenv("CALLBACK_PUBLIC_BASE_URL", "").strip()
+ADMIN_PHONE_WHITELIST = {
+    x.strip()
+    for x in os.getenv("ADMIN_PHONE_WHITELIST", "").split(",")
+    if x.strip()
+}
+
+SMS_HUARUI_API_URL = os.getenv("SMS_HUARUI_API_URL", "").strip()
+SMS_HUARUI_APPKEY = os.getenv("SMS_HUARUI_APPKEY", "").strip()
+SMS_HUARUI_APPSECRET = os.getenv("SMS_HUARUI_APPSECRET", "").strip()
+SMS_HUARUI_SIGN = os.getenv("SMS_HUARUI_SIGN", "【南京亚美达科技】").strip()
+SMS_CODE_EXPIRE_MINUTES = int(os.getenv("SMS_CODE_EXPIRE_MINUTES", "15"))
+
+
+app = FastAPI(title="WorkTool Bot Console API", version=APP_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+logger = logging.getLogger("backend")
 
 
 def now_iso() -> str:
@@ -39,14 +61,17 @@ def now_iso() -> str:
 
 def normalize_worktool_api_base(value: str) -> str:
     raw = (value or "").strip()
-    if not raw:
-        return WORKTOOL_API_BASE_DEFAULT
-    return raw.rstrip("/")
+    return raw.rstrip("/") if raw else WORKTOOL_API_BASE_DEFAULT
 
 
 def normalize_public_base_url(value: str) -> str:
-    raw = (value or "").strip()
-    return raw.rstrip("/")
+    return (value or "").strip().rstrip("/")
+
+
+def parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).lower() in {"1", "true", "yes", "on"}
 
 
 def mask_token(token: str) -> str:
@@ -57,688 +82,529 @@ def mask_token(token: str) -> str:
     return f"{token[:4]}****{token[-4:]}"
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def init_db() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS robots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            robot_id TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL,
-            private_chat_enabled INTEGER NOT NULL DEFAULT 1,
-            group_chat_enabled INTEGER NOT NULL DEFAULT 1,
-            group_reply_only_when_mentioned INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS ai_providers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            robot_id TEXT NOT NULL DEFAULT '',
-            name TEXT NOT NULL,
-            base_url TEXT NOT NULL,
-            api_token TEXT NOT NULL,
-            model TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(name)
-        );
-
-        CREATE TABLE IF NOT EXISTS routing_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            robot_id TEXT NOT NULL,
-            scene TEXT NOT NULL CHECK(scene IN ('group', 'private')),
-            pattern TEXT NOT NULL,
-            provider_id INTEGER NOT NULL,
-            priority INTEGER NOT NULL DEFAULT 100,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(robot_id) REFERENCES robots(robot_id) ON DELETE CASCADE,
-            FOREIGN KEY(provider_id) REFERENCES ai_providers(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS default_replies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            robot_id TEXT NOT NULL,
-            scene TEXT NOT NULL CHECK(scene IN ('group', 'private')),
-            reply_text TEXT,
-            updated_at TEXT NOT NULL,
-            UNIQUE(robot_id, scene),
-            FOREIGN KEY(robot_id) REFERENCES robots(robot_id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS message_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            robot_id TEXT NOT NULL,
-            direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
-            scene TEXT NOT NULL CHECK(scene IN ('group', 'private')),
-            group_name TEXT,
-            sender_name TEXT,
-            receiver_name TEXT,
-            at_me INTEGER,
-            text_type INTEGER,
-            raw_content TEXT,
-            normalized_content TEXT,
-            provider_name TEXT,
-            status TEXT NOT NULL CHECK(status IN ('received', 'success', 'skipped', 'failed')),
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(robot_id) REFERENCES robots(robot_id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS reply_decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            inbound_log_id INTEGER NOT NULL,
-            decision TEXT NOT NULL CHECK(decision IN ('reply', 'skip')),
-            reason_code TEXT NOT NULL,
-            reason_text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(inbound_log_id) REFERENCES message_logs(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS operator_audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action TEXT NOT NULL,
-            target_type TEXT NOT NULL,
-            target_id TEXT,
-            detail TEXT,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_rules_robot_scene ON routing_rules(robot_id, scene, priority);
-        CREATE INDEX IF NOT EXISTS idx_logs_robot_time ON message_logs(robot_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_logs_direction_time ON message_logs(direction, created_at);
-        """
-    )
-
-    robot_columns = {row["name"] for row in cur.execute("PRAGMA table_info(robots)").fetchall()}
-    if "message_api_url" in robot_columns:
-        robot_rows = cur.execute(
-            """
-            SELECT id, robot_id, name, private_chat_enabled, group_chat_enabled,
-                   group_reply_only_when_mentioned, created_at, updated_at
-            FROM robots
-            ORDER BY id ASC
-            """
-        ).fetchall()
-        cur.execute("PRAGMA foreign_keys = OFF")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS robots_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                robot_id TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                private_chat_enabled INTEGER NOT NULL DEFAULT 1,
-                group_chat_enabled INTEGER NOT NULL DEFAULT 1,
-                group_reply_only_when_mentioned INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        for row in robot_rows:
-            cur.execute(
-                """
-                INSERT INTO robots_new(
-                    id, robot_id, name, private_chat_enabled, group_chat_enabled,
-                    group_reply_only_when_mentioned, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["id"],
-                    row["robot_id"],
-                    row["name"],
-                    row["private_chat_enabled"],
-                    row["group_chat_enabled"],
-                    row["group_reply_only_when_mentioned"],
-                    row["created_at"],
-                    row["updated_at"],
-                ),
-            )
-        cur.execute("DROP TABLE robots")
-        cur.execute("ALTER TABLE robots_new RENAME TO robots")
-        cur.execute("PRAGMA foreign_keys = ON")
-
-    fk_rows = cur.execute("PRAGMA foreign_key_list(ai_providers)").fetchall()
-    provider_idx_rows = cur.execute("PRAGMA index_list(ai_providers)").fetchall()
-    has_unique_name_index = False
-    for idx in provider_idx_rows:
-        if int(idx["unique"]) != 1:
-            continue
-        idx_cols = [x["name"] for x in cur.execute(f"PRAGMA index_info({idx['name']})").fetchall()]
-        if idx_cols == ["name"]:
-            has_unique_name_index = True
-            break
-    needs_provider_migration = len(fk_rows) > 0 or not has_unique_name_index
-    if needs_provider_migration:
-        rows = cur.execute("SELECT * FROM ai_providers ORDER BY id ASC").fetchall()
-        cur.execute("PRAGMA foreign_keys = OFF")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ai_providers_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                robot_id TEXT NOT NULL DEFAULT '',
-                name TEXT NOT NULL,
-                base_url TEXT NOT NULL,
-                api_token TEXT NOT NULL,
-                model TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                provider_type TEXT NOT NULL DEFAULT 'openai',
-                auth_scheme TEXT NOT NULL DEFAULT 'bearer',
-                extra_json TEXT,
-                UNIQUE(name)
-            )
-            """
-        )
-        used_names = set()
-        for row in rows:
-            provider_name = row["name"]
-            if provider_name in used_names:
-                provider_name = f"{provider_name}_{row['id']}"
-            used_names.add(provider_name)
-            cur.execute(
-                """
-                INSERT INTO ai_providers_new(
-                    id, robot_id, name, base_url, api_token, model, enabled,
-                    created_at, updated_at, provider_type, auth_scheme, extra_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["id"],
-                    "",
-                    provider_name,
-                    row["base_url"],
-                    row["api_token"],
-                    row["model"],
-                    row["enabled"],
-                    row["created_at"],
-                    row["updated_at"],
-                    row["provider_type"] if "provider_type" in row.keys() else "openai",
-                    row["auth_scheme"] if "auth_scheme" in row.keys() else "bearer",
-                    row["extra_json"] if "extra_json" in row.keys() else None,
-                ),
-            )
-        cur.execute("DROP TABLE ai_providers")
-        cur.execute("ALTER TABLE ai_providers_new RENAME TO ai_providers")
-        cur.execute("PRAGMA foreign_keys = ON")
-    provider_columns = {row["name"] for row in cur.execute("PRAGMA table_info(ai_providers)").fetchall()}
-    if "provider_type" not in provider_columns:
-        cur.execute("ALTER TABLE ai_providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'openai'")
-    if "auth_scheme" not in provider_columns:
-        cur.execute("ALTER TABLE ai_providers ADD COLUMN auth_scheme TEXT NOT NULL DEFAULT 'bearer'")
-    if "extra_json" not in provider_columns:
-        cur.execute("ALTER TABLE ai_providers ADD COLUMN extra_json TEXT")
-
-    settings = {
-        "host": "0.0.0.0",
-        "port": "8000",
-        "log_level": "INFO",
-        "auto_generate_chat_id": "true",
-        "worktool_api_base": WORKTOOL_API_BASE_DEFAULT,
-        "default_message_api_url": DEFAULT_MESSAGE_API_URL,
-        "callback_public_base_url": "",
-        "auto_bind_message_callback_on_create": "true",
-    }
-    for key, value in settings.items():
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO app_settings(key, value, updated_at)
-            VALUES (?, ?, ?)
-            """,
-            (key, value, now_iso()),
-        )
-
-    row = cur.execute("SELECT value FROM app_settings WHERE key = 'worktool_api_base'").fetchone()
-    worktool_base = normalize_worktool_api_base((row["value"] if row else WORKTOOL_API_BASE_DEFAULT))
-    cur.execute(
-        """
-        INSERT INTO app_settings(key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """,
-        ("worktool_api_base", worktool_base, now_iso()),
-    )
-    cur.execute(
-        """
-        INSERT INTO app_settings(key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """,
-        ("default_message_api_url", f"{worktool_base}/wework/sendRawMessage", now_iso()),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def write_audit(action: str, target_type: str, target_id: str, detail: str) -> None:
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO operator_audit_logs(action, target_type, target_id, detail, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (action, target_type, target_id, detail, now_iso()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def import_config_json_if_needed() -> None:
-    conn = get_conn()
-    has_data = conn.execute("SELECT COUNT(1) AS c FROM robots").fetchone()["c"] > 0
-    conn.close()
-    if has_data or not CONFIG_JSON_PATH.exists():
-        return
-
-    with open(CONFIG_JSON_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    conn = get_conn()
-    cur = conn.cursor()
-    now = now_iso()
-    robots = data.get("robots", {})
-
-    for robot_id, cfg in robots.items():
-        cur.execute(
-            """
-            INSERT INTO robots(
-                robot_id, name, private_chat_enabled, group_chat_enabled,
-                group_reply_only_when_mentioned, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                robot_id,
-                cfg.get("name", robot_id),
-                1 if cfg.get("private_chat_enabled", True) else 0,
-                1 if cfg.get("group_chat_enabled", True) else 0,
-                1 if cfg.get("group_reply_only_when_mentioned", False) else 0,
-                now,
-                now,
-            ),
-        )
-
-        provider_ids: Dict[str, int] = {}
-        for provider_name, provider_cfg in cfg.get("llm_apis", {}).items():
-            cur.execute(
-                """
-                INSERT INTO ai_providers(
-                    robot_id, name, base_url, api_token, model, enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                """,
-                (
-                    robot_id,
-                    provider_name,
-                    provider_cfg.get("url", ""),
-                    provider_cfg.get("token", ""),
-                    provider_cfg.get("model"),
-                    now,
-                    now,
-                ),
-            )
-            provider_ids[provider_name] = cur.lastrowid
-
-        group_priority = 1
-        for pattern, provider_name in cfg.get("group_llm_rules", {}).items():
-            if provider_name not in provider_ids:
-                continue
-            cur.execute(
-                """
-                INSERT INTO routing_rules(
-                    robot_id, scene, pattern, provider_id, priority, enabled, created_at, updated_at
-                ) VALUES (?, 'group', ?, ?, ?, 1, ?, ?)
-                """,
-                (robot_id, pattern, provider_ids[provider_name], group_priority, now, now),
-            )
-            group_priority += 1
-
-        private_priority = 1
-        for pattern, provider_name in cfg.get("private_llm_rules", {}).items():
-            if provider_name not in provider_ids:
-                continue
-            cur.execute(
-                """
-                INSERT INTO routing_rules(
-                    robot_id, scene, pattern, provider_id, priority, enabled, created_at, updated_at
-                ) VALUES (?, 'private', ?, ?, ?, 1, ?, ?)
-                """,
-                (robot_id, pattern, provider_ids[provider_name], private_priority, now, now),
-            )
-            private_priority += 1
-
-        cur.execute(
-            """
-            INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
-            VALUES (?, 'group', ?, ?)
-            ON CONFLICT(robot_id, scene) DO UPDATE SET
-                reply_text = excluded.reply_text,
-                updated_at = excluded.updated_at
-            """,
-            (robot_id, cfg.get("group_default_reply"), now),
-        )
-        cur.execute(
-            """
-            INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
-            VALUES (?, 'private', ?, ?)
-            ON CONFLICT(robot_id, scene) DO UPDATE SET
-                reply_text = excluded.reply_text,
-                updated_at = excluded.updated_at
-            """,
-            (robot_id, cfg.get("private_default_reply"), now),
-        )
-
-    app_settings = data.get("app_settings", {})
-    for key, value in app_settings.items():
-        cur.execute(
-            """
-            INSERT INTO app_settings(key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (key, str(value).lower() if isinstance(value, bool) else str(value), now),
-        )
-
-    conn.commit()
-    conn.close()
-
-
-def get_setting(key: str, default: str = "") -> str:
-    conn = get_conn()
-    try:
-        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else default
-    except sqlite3.OperationalError:
-        return default
-    finally:
-        conn.close()
-
-
-def set_setting(key: str, value: str) -> None:
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO app_settings(key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """,
-        (key, value, now_iso()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_worktool_api_base() -> str:
-    base = get_setting("worktool_api_base", WORKTOOL_API_BASE_DEFAULT)
-    return normalize_worktool_api_base(base)
-
-
-def get_default_message_api_url() -> str:
-    return f"{get_worktool_api_base()}/wework/sendRawMessage"
-
-
-def get_callback_public_base_url() -> str:
-    return normalize_public_base_url(get_setting("callback_public_base_url", ""))
-
-
-def build_robot_callback_url(robot_id: str) -> str:
-    base = get_callback_public_base_url()
-    if not base:
-        return ""
-    rid = (robot_id or "").strip()
-    if not rid:
-        return ""
-    return f"{base}/api/v1/callback/qa/{rid}"
-
-
-def _detect_local_ips() -> List[str]:
-    ips: set[str] = set()
-    try:
-        _, _, host_ips = socket.gethostbyname_ex(socket.gethostname())
-        for ip in host_ips:
-            if ip and not ip.startswith("127."):
-                ips.add(ip)
-    except Exception:
-        pass
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        if local_ip and not local_ip.startswith("127."):
-            ips.add(local_ip)
-    except Exception:
-        pass
-    return sorted(ips)
-
-
-def _split_host_port(host: str) -> Tuple[str, str]:
-    raw = (host or "").strip()
-    if not raw:
-        return "", ""
-    if raw.startswith("["):
-        # IPv6 host in RFC 2732 form, e.g. [2001:db8::1]:8080
-        right = raw.find("]")
-        if right > 0:
-            host_part = raw[1:right]
-            rest = raw[right + 1 :]
-            if rest.startswith(":"):
-                return host_part, rest[1:]
-            return host_part, ""
-    if raw.count(":") == 1:
-        host_part, maybe_port = raw.rsplit(":", 1)
-        if maybe_port.isdigit():
-            return host_part, maybe_port
-    return raw, ""
-
-
-def _is_domain_host(host: str) -> bool:
-    value = (host or "").strip().lower()
-    if not value or value == "localhost":
-        return False
-    try:
-        ipaddress.ip_address(value)
-        return False
-    except ValueError:
-        return True
-
-
-def _is_global_ip_host(host: str) -> bool:
-    try:
-        return ipaddress.ip_address((host or "").strip()).is_global
-    except ValueError:
-        return False
-
-
-def _first_forwarded_value(value: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        return ""
-    return raw.split(",", 1)[0].strip()
-
-
-def _detect_request_scheme(request: Request) -> str:
-    # Try common reverse-proxy headers first, then fall back to ASGI scheme.
-    candidates = [
-        request.headers.get("x-forwarded-proto"),
-        request.headers.get("x-forwarded-scheme"),
-        request.headers.get("x-scheme"),
-    ]
-    for item in candidates:
-        first = _first_forwarded_value(item or "").lower()
-        if first in {"http", "https"}:
-            return first
-    # Cloudflare may send JSON like {"scheme":"https"} in CF-Visitor.
-    cf_visitor = (request.headers.get("cf-visitor") or "").strip().lower()
-    if '"scheme":"https"' in cf_visitor:
-        return "https"
-    if '"scheme":"http"' in cf_visitor:
-        return "http"
-    return request.url.scheme or "http"
-
-
-def _detect_request_host(request: Request) -> str:
-    forwarded_host = _first_forwarded_value(request.headers.get("x-forwarded-host") or "")
-    host_header = _first_forwarded_value(request.headers.get("host") or "")
-    return forwarded_host or host_header
-
-
-async def _detect_public_ip() -> str:
-    timeout = aiohttp.ClientTimeout(total=2)
-    providers = [
-        ("https://api.ipify.org?format=json", "json"),
-        ("https://ifconfig.me/ip", "text"),
-    ]
-    for url, mode in providers:
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        continue
-                    if mode == "json":
-                        data = await resp.json()
-                        ip = str(data.get("ip") or "").strip()
-                    else:
-                        ip = (await resp.text()).strip()
-                    if ip:
-                        return ip
-        except Exception:
-            continue
-    return ""
-
-
-def parse_bool(value: str, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return str(value).lower() in {"1", "true", "yes", "on"}
-
-
-def resolve_auth_scheme(
-    provider_type: Literal["openai", "openclaw"],
-    auth_scheme: Optional[Literal["bearer", "x-openclaw-token", "none"]] = None,
-) -> Literal["bearer", "x-openclaw-token", "none"]:
-    if auth_scheme is not None:
-        return auth_scheme
-    if provider_type == "openclaw":
-        return "x-openclaw-token"
-    return "bearer"
-
-
-def _load_env_file(path: Path) -> Dict[str, str]:
-    if not path.exists():
-        return {}
-    env: Dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, v = s.split("=", 1)
-        env[k.strip()] = v.strip()
-    return env
-
-
-def _get_worktool_mysql_config() -> Optional[Dict[str, Any]]:
-    if pymysql is None:
-        return None
-    env = {}
-    env.update(_load_env_file(PROJECT_ROOT / "worktool_robot_check" / ".env"))
-    env.update(_load_env_file(PROJECT_ROOT / ".env"))
-    host = os.getenv("DB_HOST") or os.getenv("WORKTOOL_DB_HOST") or env.get("DB_HOST")
-    port = os.getenv("DB_PORT") or os.getenv("WORKTOOL_DB_PORT") or env.get("DB_PORT") or "3306"
-    user = os.getenv("DB_USER") or os.getenv("WORKTOOL_DB_USER") or env.get("DB_USER")
-    password = os.getenv("DB_PASSWORD") or os.getenv("WORKTOOL_DB_PASSWORD") or env.get("DB_PASSWORD")
-    database = os.getenv("DB_NAME") or os.getenv("WORKTOOL_DB_NAME") or env.get("DB_NAME")
+def _db_cfg() -> Dict[str, Any]:
+    host = os.getenv("APP_MYSQL_HOST", "").strip()
+    port = int(os.getenv("APP_MYSQL_PORT", "3306").strip())
+    user = os.getenv("APP_MYSQL_USER", "").strip()
+    password = os.getenv("APP_MYSQL_PASSWORD", "")
+    database = os.getenv("APP_MYSQL_DATABASE", "").strip()
     if not (host and user and database):
-        return None
+        raise HTTPException(status_code=503, detail="auth mysql not configured")
     return {
         "host": host,
-        "port": int(port),
+        "port": port,
         "user": user,
-        "password": password or "",
+        "password": password,
         "database": database,
         "charset": "utf8mb4",
         "cursorclass": pymysql.cursors.DictCursor,
+        "autocommit": False,
         "connect_timeout": 5,
         "read_timeout": 15,
         "write_timeout": 15,
     }
 
 
-def _mysql_query(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-    cfg = _get_worktool_mysql_config()
-    if not cfg:
-        return []
+def db_conn() -> Any:
+    return pymysql.connect(**_db_cfg())
+
+
+def init_db() -> None:
+    conn = db_conn()
     try:
-        conn = pymysql.connect(**cfg)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                return list(cur.fetchall() or [])
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  phone VARCHAR(20) NOT NULL UNIQUE,
+                  password_hash VARCHAR(255) NOT NULL,
+                  company_name VARCHAR(128) NULL,
+                  token_version INT NOT NULL DEFAULT 0,
+                  is_active TINYINT(1) NOT NULL DEFAULT 1,
+                  last_login_at DATETIME NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute("SHOW COLUMNS FROM users LIKE 'last_login_at'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE users ADD COLUMN last_login_at DATETIME NULL")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sms_codes (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  phone VARCHAR(20) NOT NULL,
+                  scene ENUM('register','reset_password','login') NOT NULL,
+                  code_hash VARCHAR(255) NOT NULL,
+                  expire_at DATETIME NOT NULL,
+                  used_at DATETIME NULL,
+                  request_ip VARCHAR(64) NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  INDEX idx_sms_phone_scene_created (phone, scene, created_at),
+                  INDEX idx_sms_expire (expire_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS robots (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  robot_id VARCHAR(128) NOT NULL UNIQUE,
+                  name VARCHAR(255) NOT NULL,
+                  private_chat_enabled TINYINT(1) NOT NULL DEFAULT 1,
+                  group_chat_enabled TINYINT(1) NOT NULL DEFAULT 1,
+                  group_reply_only_when_mentioned TINYINT(1) NOT NULL DEFAULT 0,
+                  version INT NOT NULL DEFAULT 0,
+                  created_by BIGINT NOT NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  CONSTRAINT fk_robots_created_by FOREIGN KEY (created_by) REFERENCES users(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_robots (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  user_id BIGINT NOT NULL,
+                  robot_pk BIGINT NOT NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  UNIQUE KEY uk_user_robot (user_id, robot_pk),
+                  INDEX idx_user_robots_user (user_id),
+                  INDEX idx_user_robots_robot (robot_pk),
+                  CONSTRAINT fk_user_robots_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                  CONSTRAINT fk_user_robots_robot FOREIGN KEY (robot_pk) REFERENCES robots(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_providers (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  created_by BIGINT NOT NULL,
+                  name VARCHAR(128) NOT NULL UNIQUE,
+                  base_url VARCHAR(512) NOT NULL,
+                  api_token TEXT NOT NULL,
+                  model VARCHAR(128) NULL,
+                  provider_type ENUM('openai','openclaw') NOT NULL DEFAULT 'openai',
+                  auth_scheme ENUM('bearer','x-openclaw-token','none') NOT NULL DEFAULT 'bearer',
+                  extra_json JSON NULL,
+                  enabled TINYINT(1) NOT NULL DEFAULT 1,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  INDEX idx_provider_created_by (created_by),
+                  CONSTRAINT fk_provider_created_by FOREIGN KEY (created_by) REFERENCES users(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS routing_rules (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  robot_pk BIGINT NOT NULL,
+                  scene ENUM('group','private') NOT NULL,
+                  pattern VARCHAR(1024) NOT NULL,
+                  provider_id BIGINT NOT NULL,
+                  priority INT NOT NULL DEFAULT 100,
+                  enabled TINYINT(1) NOT NULL DEFAULT 1,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  INDEX idx_rules_robot_scene_priority (robot_pk, scene, priority),
+                  CONSTRAINT fk_rules_robot FOREIGN KEY (robot_pk) REFERENCES robots(id) ON DELETE CASCADE,
+                  CONSTRAINT fk_rules_provider FOREIGN KEY (provider_id) REFERENCES ai_providers(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute("SHOW COLUMNS FROM ai_providers LIKE 'robot_pk'")
+            if cur.fetchone():
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_providers_new (
+                      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                      created_by BIGINT NOT NULL,
+                      name VARCHAR(128) NOT NULL UNIQUE,
+                      base_url VARCHAR(512) NOT NULL,
+                      api_token TEXT NOT NULL,
+                      model VARCHAR(128) NULL,
+                      provider_type ENUM('openai','openclaw') NOT NULL DEFAULT 'openai',
+                      auth_scheme ENUM('bearer','x-openclaw-token','none') NOT NULL DEFAULT 'bearer',
+                      extra_json JSON NULL,
+                      enabled TINYINT(1) NOT NULL DEFAULT 1,
+                      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                      INDEX idx_provider_created_by (created_by),
+                      CONSTRAINT fk_provider_created_by FOREIGN KEY (created_by) REFERENCES users(id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO ai_providers_new(id,created_by,name,base_url,api_token,model,provider_type,auth_scheme,extra_json,enabled,created_at,updated_at)
+                    SELECT id,
+                           COALESCE((SELECT MIN(id) FROM users), 1) AS created_by,
+                           CASE WHEN cnt > 1 THEN CONCAT(name, '_', id) ELSE name END AS name,
+                           base_url,api_token,model,provider_type,auth_scheme,extra_json,enabled,created_at,updated_at
+                    FROM (
+                      SELECT p.*,
+                             COUNT(*) OVER(PARTITION BY p.name) AS cnt
+                      FROM ai_providers p
+                    ) t
+                    ORDER BY id ASC
+                    """
+                )
+                try:
+                    cur.execute("ALTER TABLE routing_rules DROP FOREIGN KEY fk_rules_provider")
+                except Exception:
+                    pass
+                cur.execute("DROP TABLE ai_providers")
+                cur.execute("RENAME TABLE ai_providers_new TO ai_providers")
+                try:
+                    cur.execute(
+                        """
+                        ALTER TABLE routing_rules
+                        ADD CONSTRAINT fk_rules_provider
+                        FOREIGN KEY (provider_id) REFERENCES ai_providers(id) ON DELETE CASCADE
+                        """
+                    )
+                except Exception:
+                    pass
+            cur.execute("SHOW COLUMNS FROM ai_providers LIKE 'created_by'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE ai_providers ADD COLUMN created_by BIGINT NULL")
+                cur.execute(
+                    """
+                    UPDATE ai_providers p
+                    LEFT JOIN (
+                      SELECT r.provider_id, MIN(ur.user_id) AS user_id
+                      FROM routing_rules r
+                      JOIN user_robots ur ON ur.robot_pk=r.robot_pk
+                      GROUP BY r.provider_id
+                    ) t ON t.provider_id=p.id
+                    SET p.created_by=COALESCE(t.user_id, (SELECT MIN(id) FROM users))
+                    WHERE p.created_by IS NULL
+                    """
+                )
+                cur.execute("ALTER TABLE ai_providers MODIFY COLUMN created_by BIGINT NOT NULL")
+            try:
+                cur.execute("ALTER TABLE ai_providers ADD INDEX idx_provider_created_by (created_by)")
+            except Exception:
+                pass
+            try:
+                cur.execute(
+                    """
+                    ALTER TABLE ai_providers
+                    ADD CONSTRAINT fk_provider_created_by FOREIGN KEY (created_by) REFERENCES users(id)
+                    """
+                )
+            except Exception:
+                pass
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS default_replies (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  robot_pk BIGINT NOT NULL,
+                  scene ENUM('group','private') NOT NULL,
+                  reply_text TEXT NULL,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  UNIQUE KEY uk_default_reply_robot_scene (robot_pk, scene),
+                  CONSTRAINT fk_default_replies_robot FOREIGN KEY (robot_pk) REFERENCES robots(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_settings (
+                  `key` VARCHAR(64) PRIMARY KEY,
+                  `value` TEXT NOT NULL,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_sms_record (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  account VARCHAR(32) NOT NULL,
+                  source VARCHAR(64) NOT NULL,
+                  source_ip VARCHAR(64) NOT NULL,
+                  phone VARCHAR(16) NOT NULL,
+                  sign VARCHAR(32) DEFAULT NULL,
+                  content VARCHAR(512) NOT NULL,
+                  send_time DATETIME NOT NULL,
+                  msgid VARCHAR(64) NOT NULL,
+                  result VARCHAR(1024) NOT NULL,
+                  KEY idx_sms_record_phone (phone),
+                  KEY idx_sms_record_send_time (send_time),
+                  KEY idx_sms_record_source (source)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_logs (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  robot_pk BIGINT NOT NULL,
+                  direction ENUM('inbound','outbound') NOT NULL,
+                  scene ENUM('group','private') NOT NULL,
+                  normalized_content TEXT,
+                  status ENUM('received','success','skipped','failed') NOT NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  INDEX idx_logs_robot_time (robot_pk, created_at),
+                  CONSTRAINT fk_logs_robot FOREIGN KEY (robot_pk) REFERENCES robots(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+
+            cur.execute("SELECT 1 FROM app_settings WHERE `key`='worktool_api_base' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO app_settings(`key`,`value`) VALUES('worktool_api_base', %s)",
+                    (WORKTOOL_API_BASE_DEFAULT,),
+                )
+            cur.execute("SELECT 1 FROM app_settings WHERE `key`='auto_bind_message_callback_on_create' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO app_settings(`key`,`value`) VALUES('auto_bind_message_callback_on_create','true')"
+                )
+            cur.execute("SELECT 1 FROM app_settings WHERE `key`='callback_public_base_url' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO app_settings(`key`,`value`) VALUES('callback_public_base_url','')"
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `value` FROM app_settings WHERE `key`=%s LIMIT 1", (key,))
+            row = cur.fetchone()
+            return str(row["value"]) if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_settings(`key`,`value`) VALUES(%s,%s)
+                ON DUPLICATE KEY UPDATE `value`=VALUES(`value`), updated_at=CURRENT_TIMESTAMP
+                """,
+                (key, value),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_valid_phone(phone: str) -> bool:
+    p = (phone or "").strip()
+    return bool(re.fullmatch(r"1\d{10}", p)) and not p.startswith("170")
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, AUTH_PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${AUTH_PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iter_str, salt_hex, digest_hex = (stored or "").split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iter_str)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return secrets.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _hash_sms_code(code: str) -> str:
+    pepper = AUTH_JWT_SECRET or "dev-pepper"
+    digest = hashlib.sha256(f"{code}|{pepper}".encode("utf-8")).hexdigest()
+    return f"sha256${digest}"
+
+
+def _verify_sms_code(code: str, stored: str) -> bool:
+    if not stored or not stored.startswith("sha256$"):
+        return False
+    expected = stored.split("$", 1)[1]
+    actual = _hash_sms_code(code).split("$", 1)[1]
+    return secrets.compare_digest(actual, expected)
+
+
+def _consume_sms_code(cur: Any, phone: str, scene: str, code: str) -> bool:
+    cur.execute(
+        """
+        SELECT id,code_hash FROM sms_codes
+        WHERE phone=%s AND scene=%s AND used_at IS NULL AND expire_at > UTC_TIMESTAMP()
+        ORDER BY id DESC LIMIT 20
+        """,
+        (phone, scene),
+    )
+    rows = cur.fetchall() or []
+    for row in rows:
+        if _verify_sms_code(code, str(row["code_hash"])):
+            cur.execute("UPDATE sms_codes SET used_at=UTC_TIMESTAMP() WHERE id=%s", (row["id"],))
+            return True
+    return False
+
+
+def _create_access_token(user_id: int, token_version: int) -> str:
+    if not AUTH_JWT_SECRET:
+        raise HTTPException(status_code=503, detail="jwt secret not configured")
+    now = datetime.utcnow()
+    payload = {
+        "sub": str(user_id),
+        "token_version": int(token_version),
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=AUTH_JWT_EXPIRE_DAYS)).timestamp()),
+    }
+    return jwt.encode(payload, AUTH_JWT_SECRET, algorithm="HS256")
+
+
+def _parse_bearer_token(authorization: Optional[str]) -> str:
+    raw = (authorization or "").strip()
+    if not raw.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = raw[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    return token
+
+
+def _decode_access_token(token: str) -> Dict[str, Any]:
+    if not AUTH_JWT_SECRET:
+        raise HTTPException(status_code=503, detail="jwt secret not configured")
+    try:
+        return jwt.decode(token, AUTH_JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError as e:
+        raise HTTPException(status_code=401, detail="token expired") from e
     except Exception as e:
-        logger.warning("mysql query failed: %s", e)
-        return []
+        raise HTTPException(status_code=401, detail="invalid token") from e
 
 
-def parse_extra_json(extra_json: Optional[str]) -> Dict[str, Any]:
-    if not extra_json:
-        return {}
+def _is_admin_phone(phone: str) -> bool:
+    p = (phone or "").strip()
+    return bool(p) and p in ADMIN_PHONE_WHITELIST
+
+
+def _require_admin(user: Dict[str, Any]) -> None:
+    if not _is_admin_phone(str(user.get("phone") or "")):
+        raise HTTPException(status_code=403, detail="仅管理员可访问")
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+    token = _parse_bearer_token(authorization)
+    payload = _decode_access_token(token)
     try:
-        data = json.loads(extra_json)
-        if isinstance(data, dict):
+        user_id = int(payload.get("sub", 0))
+        token_version = int(payload.get("token_version", -1))
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="invalid token payload") from e
+    if user_id <= 0:
+        raise HTTPException(status_code=401, detail="invalid token subject")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,phone,company_name,token_version,is_active,last_login_at,created_at,updated_at FROM users WHERE id=%s LIMIT 1",
+                (user_id,),
+            )
+            user = cur.fetchone()
+        if not user or int(user["is_active"]) != 1:
+            raise HTTPException(status_code=401, detail="user not active")
+        if int(user["token_version"]) != token_version:
+            raise HTTPException(status_code=401, detail="token revoked")
+        return user
+    finally:
+        conn.close()
+
+
+def _sms_signature(timestamp_ms: int) -> str:
+    raw = f"{SMS_HUARUI_APPKEY}{SMS_HUARUI_APPSECRET}{timestamp_ms}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+async def _send_sms_via_huarui(phone: str, content: str) -> Dict[str, Any]:
+    if not SMS_HUARUI_API_URL or not SMS_HUARUI_APPKEY or not SMS_HUARUI_APPSECRET:
+        raise HTTPException(status_code=503, detail="sms provider not configured")
+    ts_ms = int(datetime.utcnow().timestamp() * 1000)
+    body = {
+        "appkey": SMS_HUARUI_APPKEY,
+        "appsecret": SMS_HUARUI_APPSECRET,
+        "appcode": "1000",
+        "timestamp": ts_ms,
+        "sign": _sms_signature(ts_ms),
+        "phone": phone,
+        "msg": content,
+    }
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(SMS_HUARUI_API_URL, json=body) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=f"sms upstream status={resp.status}")
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=502, detail="sms upstream invalid response")
             return data
-        return {}
-    except json.JSONDecodeError:
-        return {}
 
 
-def normalize_extra_json(extra_json: Optional[str]) -> Optional[str]:
-    if extra_json is None:
-        return None
-    cleaned = extra_json.strip()
-    if not cleaned:
-        return None
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"extra_json 不是有效JSON: {e}") from e
-    if not isinstance(parsed, dict):
-        raise ValueError("extra_json 必须是JSON对象")
-    return json.dumps(parsed, ensure_ascii=False)
-
-
+# ----- models -----
 class QARequest(BaseModel):
     spoken: str = ""
     rawSpoken: str = ""
-    receivedName: str
+    receivedName: str = ""
     groupName: Optional[str] = None
-    groupRemark: Optional[str] = None
-    roomType: int
-    atMe: bool
-    textType: int
+    roomType: int = 0
+    atMe: bool = False
+    textType: int = 1
 
 
 class QAResponse(BaseModel):
     code: int = 0
     message: str = "success"
+
+
+class SmsSendRequest(BaseModel):
+    phone: str
+    scene: Literal["register", "reset_password", "login"] = "register"
+
+
+class AuthRegisterRequest(BaseModel):
+    phone: str
+    sms_code: Optional[str] = None
+    password: str
+    company_name: Optional[str] = None
+
+
+class AuthLoginRequest(BaseModel):
+    phone: str
+    password: str
+
+
+class AuthResetPasswordRequest(BaseModel):
+    phone: str
+    sms_code: Optional[str] = None
+    new_password: str
+
+
+class WorkToolSettingsUpdate(BaseModel):
+    worktool_api_base: Optional[str] = None
+    callback_public_base_url: Optional[str] = None
+    auto_bind_message_callback_on_create: Optional[bool] = None
 
 
 class RobotCreate(BaseModel):
@@ -782,25 +648,9 @@ class ProviderUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
-class OpenClawPushItem(BaseModel):
-    type: int = 203
-    receiver: str
-    content: Optional[str] = None
-    object_name: Optional[str] = None
-    file_url: Optional[str] = None
-    file_type: Optional[str] = None
-    extra_text: Optional[str] = None
-
-
-class OpenClawPushPayload(BaseModel):
-    provider_id: Optional[int] = None
-    provider_name: Optional[str] = None
-    list: List[OpenClawPushItem] = Field(default_factory=list)
-
-
 class RuleCreate(BaseModel):
     robot_id: str
-    scene: str
+    scene: Literal["group", "private"]
     pattern: str
     provider_id: int
     priority: int = 100
@@ -840,719 +690,690 @@ class CallbackTestPayload(BaseModel):
     callback_url: str
 
 
-class WorkToolSettingsUpdate(BaseModel):
-    worktool_api_base: Optional[str] = None
-    callback_public_base_url: Optional[str] = None
-    auto_bind_message_callback_on_create: Optional[bool] = None
-
-
-class TroubleshootSearchPayload(BaseModel):
-    robot_id: str = ""
-    message_id: str = ""
-    keyword: str = ""
-    start_time: str = ""
-    end_time: str = ""
-    limit: int = 20
-
-
-class MessageProcessor:
-    def __init__(self) -> None:
-        self.logger = logging.getLogger("message_processor")
-
-    def _get_robot(self, robot_id: str) -> Optional[sqlite3.Row]:
-        conn = get_conn()
-        row = conn.execute(
-            """
-            SELECT *
-            FROM robots
-            WHERE robot_id = ?
-            """,
-            (robot_id,),
-        ).fetchone()
-        conn.close()
-        return row
-
-    def _insert_message_log(
-        self,
-        robot_id: str,
-        direction: str,
-        scene: str,
-        group_name: Optional[str],
-        sender_name: Optional[str],
-        receiver_name: Optional[str],
-        at_me: Optional[bool],
-        text_type: Optional[int],
-        raw_content: str,
-        normalized_content: str,
-        provider_name: Optional[str],
-        status: str,
-        error_message: Optional[str] = None,
-    ) -> int:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO message_logs(
-                robot_id, direction, scene, group_name, sender_name, receiver_name,
-                at_me, text_type, raw_content, normalized_content, provider_name,
-                status, error_message, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                robot_id,
-                direction,
-                scene,
-                group_name,
-                sender_name,
-                receiver_name,
-                1 if at_me else 0 if at_me is not None else None,
-                text_type,
-                raw_content,
-                normalized_content,
-                provider_name,
-                status,
-                error_message,
-                now_iso(),
-            ),
-        )
-        inserted_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-        return inserted_id
-
-    def _insert_decision(self, inbound_log_id: int, decision: str, code: str, text: str) -> None:
-        conn = get_conn()
-        conn.execute(
-            """
-            INSERT INTO reply_decisions(
-                inbound_log_id, decision, reason_code, reason_text, created_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (inbound_log_id, decision, code, text, now_iso()),
-        )
-        conn.commit()
+# ----- permission helpers -----
+def _bound_robot_pk_set(user_id: int) -> set:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT robot_pk FROM user_robots WHERE user_id=%s", (user_id,))
+            return {int(x["robot_pk"]) for x in (cur.fetchall() or [])}
+    finally:
         conn.close()
 
-    def _get_recent_group_messages(self, robot_id: str, group_name: str, limit: int = 5) -> List[Dict[str, Any]]:
-        conn = get_conn()
-        rows = conn.execute(
-            """
-            SELECT sender_name, normalized_content, direction, created_at
-            FROM message_logs
-            WHERE robot_id = ? AND scene = 'group' AND group_name = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (robot_id, group_name, limit),
-        ).fetchall()
+
+def _get_robot_by_id_or_404(robot_id: str) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM robots WHERE robot_id=%s LIMIT 1", (robot_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="robot not found")
+            return row
+    finally:
         conn.close()
-        items: List[Dict[str, Any]] = []
-        for row in reversed(rows):
-            items.append(
-                {
-                    "sender": row["sender_name"],
-                    "content": row["normalized_content"],
-                    "direction": row["direction"],
-                    "time": row["created_at"],
-                }
+
+
+def _require_robot_access(user_id: int, robot_id: str) -> Dict[str, Any]:
+    row = _get_robot_by_id_or_404(robot_id)
+    if int(row["id"]) not in _bound_robot_pk_set(user_id):
+        raise HTTPException(status_code=403, detail="无权访问该机器人")
+    return row
+
+
+def _provider_exists(provider_id: int) -> bool:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM ai_providers WHERE id=%s LIMIT 1", (provider_id,))
+            return bool(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def _provider_owned_by_user(provider_id: int, user_id: int) -> bool:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM ai_providers WHERE id=%s AND created_by=%s LIMIT 1", (provider_id, user_id))
+            return bool(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def _provider_accessible_by_user(provider_id: int, user_id: int) -> bool:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM ai_providers p
+                WHERE p.id=%s
+                  AND (
+                    p.created_by=%s OR EXISTS(
+                      SELECT 1
+                      FROM routing_rules r
+                      JOIN user_robots ur ON ur.robot_pk=r.robot_pk
+                      WHERE r.provider_id=p.id AND ur.user_id=%s
+                    )
+                  )
+                LIMIT 1
+                """,
+                (provider_id, user_id, user_id),
             )
-        return items
-
-    def _find_last_user_message(self, robot_id: str, group_name: str, sender_name: str) -> Optional[str]:
-        conn = get_conn()
-        row = conn.execute(
-            """
-            SELECT normalized_content
-            FROM message_logs
-            WHERE robot_id = ? AND scene = 'group'
-              AND direction = 'inbound' AND group_name = ? AND sender_name = ?
-              AND COALESCE(normalized_content, '') <> ''
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (robot_id, group_name, sender_name),
-        ).fetchone()
+            return bool(cur.fetchone())
+    finally:
         conn.close()
-        return row["normalized_content"] if row else None
 
-    def _get_rules(self, robot_id: str, scene: str) -> List[sqlite3.Row]:
-        conn = get_conn()
-        rows = conn.execute(
-            """
-            SELECT
-                r.*,
-                p.name AS provider_name,
-                p.base_url,
-                p.api_token,
-                p.model,
-                p.enabled AS provider_enabled,
-                p.provider_type,
-                p.auth_scheme,
-                p.extra_json
-            FROM routing_rules r
-            JOIN ai_providers p ON p.id = r.provider_id
-            WHERE r.robot_id = ? AND r.scene = ? AND r.enabled = 1
-            ORDER BY r.priority ASC, r.id ASC
-            """,
-            (robot_id, scene),
-        ).fetchall()
-        conn.close()
-        return rows
 
-    def _find_common_provider(self, robot_id: str) -> Optional[sqlite3.Row]:
-        conn = get_conn()
-        row = conn.execute(
-            """
-            SELECT *
-            FROM ai_providers
-            WHERE name = 'common' AND enabled = 1
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-        ).fetchone()
-        conn.close()
-        return row
+def _resolve_auth_scheme(provider_type: str, auth_scheme: Optional[str]) -> str:
+    if auth_scheme:
+        return auth_scheme
+    return "x-openclaw-token" if provider_type == "openclaw" else "bearer"
 
-    def _find_provider_for_scene(self, robot_id: str, scene: str, target_name: str) -> Optional[sqlite3.Row]:
-        for rule in self._get_rules(robot_id, scene):
-            try:
-                if re.match(rule["pattern"], target_name):
-                    return rule
-            except re.error as e:
-                self.logger.error("invalid regex pattern id=%s: %s", rule["id"], e)
+
+def _normalize_extra_json(extra_json: Optional[str]) -> Optional[str]:
+    if extra_json is None:
         return None
+    s = extra_json.strip()
+    if not s:
+        return None
+    try:
+        parsed = json.loads(s)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"extra_json 不是有效JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="extra_json 必须是JSON对象")
+    return json.dumps(parsed, ensure_ascii=False)
 
-    def _get_default_reply(self, robot_id: str, scene: str) -> Optional[str]:
-        conn = get_conn()
-        row = conn.execute(
-            """
-            SELECT reply_text
-            FROM default_replies
-            WHERE robot_id = ? AND scene = ?
-            LIMIT 1
-            """,
-            (robot_id, scene),
-        ).fetchone()
+
+def get_worktool_api_base() -> str:
+    if WORKTOOL_API_BASE_FIXED_RAW:
+        return normalize_worktool_api_base(WORKTOOL_API_BASE_FIXED_RAW)
+    return normalize_worktool_api_base(get_setting("worktool_api_base", WORKTOOL_API_BASE_DEFAULT))
+
+
+def get_callback_public_base_url() -> str:
+    if CALLBACK_PUBLIC_BASE_URL_FIXED_RAW:
+        return normalize_public_base_url(CALLBACK_PUBLIC_BASE_URL_FIXED_RAW)
+    return normalize_public_base_url(get_setting("callback_public_base_url", ""))
+
+
+def build_robot_callback_url(robot_id: str) -> str:
+    base = get_callback_public_base_url()
+    if not base:
+        return ""
+    return f"{base}/api/v1/callback/qa/{robot_id.strip()}"
+
+
+async def fetch_worktool_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{get_worktool_api_base()}{path}"
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=f"worktool request failed: status={resp.status}")
+            return data if isinstance(data, dict) else {"data": data}
+
+
+async def bind_message_callback(robot_id: str, callback_url: str, reply_all: int = 1) -> Dict[str, Any]:
+    url = f"{get_worktool_api_base()}/robot/robotInfo/update"
+    timeout = aiohttp.ClientTimeout(total=10)
+    payload = {"callBackUrl": callback_url, "replyAll": int(reply_all)}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, params={"robotId": robot_id}, json=payload) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=f"绑定失败：HTTP {resp.status}")
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=502, detail="绑定失败：响应格式异常")
+            code = str(data.get("code", ""))
+            if code not in {"0", "200", ""}:
+                msg = data.get("msg") or data.get("message") or "unknown"
+                raise HTTPException(status_code=400, detail=f"绑定失败：{msg} (code={code})")
+            return data
+
+
+def _scene_from_room_type(room_type: int) -> str:
+    return "group" if int(room_type or 0) in {1, 3} else "private"
+
+
+def _pick_inbound_text(req: QARequest) -> str:
+    return (req.rawSpoken or req.spoken or "").strip()
+
+
+def _short_text(s: str, n: int = 120) -> str:
+    x = (s or "").replace("\n", "\\n").strip()
+    return x if len(x) <= n else f"{x[:n]}..."
+
+
+def _rule_match_target(scene: str, req: QARequest) -> str:
+    if scene == "group":
+        return ((req.groupName or "").strip() or (req.receivedName or "").strip())
+    return (req.receivedName or "").strip()
+
+
+def _insert_message_log(robot_pk: int, direction: str, scene: str, content: str, status: str) -> None:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO message_logs(robot_pk,direction,scene,normalized_content,status)
+                VALUES(%s,%s,%s,%s,%s)
+                """,
+                (robot_pk, direction, scene, (content or "")[:4000], status),
+            )
+        conn.commit()
+    finally:
         conn.close()
-        if not row:
-            return None
-        val = row["reply_text"]
-        if val is None:
-            return None
-        if isinstance(val, str) and not val.strip():
-            return None
-        return val
 
-    def _build_auth_headers(self, auth_scheme: str, token: str) -> Dict[str, str]:
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if auth_scheme == "none":
-            return headers
-        if auth_scheme == "x-openclaw-token":
-            headers["x-openclaw-token"] = token
-            return headers
-        headers["Authorization"] = f"Bearer {token}"
-        return headers
 
-    async def _call_provider(
-        self,
-        provider_type: str,
-        provider_name: str,
-        base_url: str,
-        token: str,
-        model: Optional[str],
-        auth_scheme: str,
-        extra_json: Optional[str],
-        robot_id: str,
-        group_name: Optional[str],
-        received_name: str,
-        messages: List[Dict[str, str]],
-    ) -> Optional[str]:
-        provider_extra = parse_extra_json(extra_json)
-        is_openrouter = "openrouter.ai" in (base_url or "").lower()
-        auto_chat_id = parse_bool(get_setting("auto_generate_chat_id", "true"), True)
-        send_chat_id = auto_chat_id and provider_type == "openai" and not is_openrouter
-        if provider_type == "openclaw":
-            send_chat_id = bool(provider_extra.get("send_chat_id", False))
-        chat_id = None
-        if send_chat_id:
-            chat_id = f"wtbot:{robot_id}:{group_name or ''}:{received_name}"
-        payload: Dict[str, Any] = {"messages": messages}
-        request_model = provider_extra.get("model") or model
-        if request_model:
-            payload["model"] = request_model
-        if chat_id:
-            payload["chatId"] = chat_id
-        if isinstance(provider_extra.get("request_body"), dict):
-            payload.update(provider_extra["request_body"])
-            payload["messages"] = messages
+def _load_default_reply(robot_pk: int, scene: str) -> str:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reply_text FROM default_replies WHERE robot_pk=%s AND scene=%s LIMIT 1",
+                (robot_pk, scene),
+            )
+            row = cur.fetchone()
+            return ((row or {}).get("reply_text") or "").strip()
+    finally:
+        conn.close()
 
-        headers = self._build_auth_headers(auth_scheme, token)
-        if isinstance(provider_extra.get("request_headers"), dict):
-            for key, value in provider_extra["request_headers"].items():
-                if value is None:
-                    continue
-                headers[str(key)] = str(value)
-        timeout = aiohttp.ClientTimeout(total=20)
+
+def _load_enabled_rules(robot_pk: int, scene: str) -> List[Dict[str, Any]]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id,r.pattern,r.priority,r.provider_id,p.name AS provider_name,p.base_url,p.api_token,p.model,p.provider_type,p.auth_scheme,p.extra_json
+                FROM routing_rules r
+                JOIN ai_providers p ON p.id=r.provider_id
+                WHERE r.robot_pk=%s AND r.scene=%s AND r.enabled=1 AND p.enabled=1
+                ORDER BY r.priority ASC, r.id ASC
+                """,
+                (robot_pk, scene),
+            )
+            return cur.fetchall() or []
+    finally:
+        conn.close()
+
+
+def _extract_provider_text(data: Any) -> str:
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content.strip()
+                if isinstance(content, list):
+                    texts: List[str] = []
+                    for x in content:
+                        if isinstance(x, dict) and isinstance(x.get("text"), str):
+                            texts.append(x["text"])
+                    return "".join(texts).strip()
+        for key in ("answer", "content", "message", "text"):
+            v = data.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if isinstance(data, str):
+        return data.strip()
+    return ""
+
+
+async def _call_provider(rule: Dict[str, Any], prompt: str) -> str:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    auth_scheme = str(rule.get("auth_scheme") or "bearer")
+    api_token = str(rule.get("api_token") or "")
+    if auth_scheme == "bearer" and api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    elif auth_scheme == "x-openclaw-token" and api_token:
+        headers["x-openclaw-token"] = api_token
+
+    payload: Dict[str, Any] = {"messages": [{"role": "user", "content": prompt}]}
+    model = (rule.get("model") or "").strip() if isinstance(rule.get("model"), str) else ""
+    if model:
+        payload["model"] = model
+
+    extra_json = rule.get("extra_json")
+    if isinstance(extra_json, str) and extra_json.strip():
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(base_url, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        self.logger.error("provider=%s call failed, status=%s", provider_name, resp.status)
-                        return None
-                    data = await resp.json()
-                    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        except Exception as e:
-            self.logger.error("provider=%s call exception: %s", provider_name, e)
-            return None
+            extra_json = json.loads(extra_json)
+        except Exception:
+            extra_json = None
+    if isinstance(extra_json, dict):
+        req_headers = extra_json.get("request_headers")
+        if isinstance(req_headers, dict):
+            for k, v in req_headers.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    headers[k] = v
+        req_body = extra_json.get("request_body")
+        if isinstance(req_body, dict):
+            payload.update(req_body)
 
-    async def _send_raw_message(
-        self, message_api_url: str, robot_id: str, message_list: List[Dict[str, Any]]
-    ) -> Tuple[bool, str]:
-        url = f"{message_api_url}?robotId={robot_id}"
-        payload = {"socketType": 2, "list": message_list}
-        timeout = aiohttp.ClientTimeout(total=15)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        return True, ""
-                    return False, f"message api status={resp.status}"
-        except Exception as e:
-            return False, str(e)
+    url = str(rule.get("base_url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=500, detail="provider base_url empty")
 
-    async def _should_reply_group(
-        self,
-        robot_id: str,
-        data: QARequest,
-        robot_cfg: sqlite3.Row,
-    ) -> Tuple[bool, str, str]:
-        if data.atMe:
-            return True, "AT_ME", "被@后强制回复"
-
-        if robot_cfg["group_reply_only_when_mentioned"] == 1:
-            return False, "NOT_MENTIONED", "未@机器人且配置要求仅@回复"
-
-        provider = self._find_common_provider(robot_id)
-        if not provider:
-            return False, "COMMON_PROVIDER_MISSING", "缺少common provider用于群聊判定"
-
-        context = self._get_recent_group_messages(robot_id, data.groupName or "", limit=5)
-        prompt = (
-            f"历史对话记录：{context}\n"
-            f"你是一个机器人AI，请判断是否需要回复【{data.receivedName}】最后一句。\n"
-            "若对机器人提问返回 A；若主要在和他人讨论返回 B。只输出一个字母。"
-        )
-        result = await self._call_provider(
-            provider_type=provider["provider_type"],
-            provider_name=provider["name"],
-            base_url=provider["base_url"],
-            token=provider["api_token"],
-            model=provider["model"],
-            auth_scheme=provider["auth_scheme"],
-            extra_json=provider["extra_json"],
-            robot_id=robot_id,
-            group_name=data.groupName,
-            received_name=data.receivedName,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        if result and "A" in result:
-            return True, "COMMON_PROVIDER_REPLY", "common判定需要回复"
-        return False, "COMMON_PROVIDER_SKIP", "common判定无需回复"
-
-    async def process_message(self, robot_id: str, data: QARequest) -> None:
-        robot_cfg = self._get_robot(robot_id)
-        if not robot_cfg:
-            self.logger.error("robot_id=%s not found", robot_id)
-            return
-
-        scene = "group" if (data.groupName and data.groupName != data.receivedName) else "private"
-        raw_content = data.rawSpoken or data.spoken or ""
-        normalized = data.spoken or ""
-
-        inbound_log_id = self._insert_message_log(
-            robot_id=robot_id,
-            direction="inbound",
-            scene=scene,
-            group_name=data.groupName,
-            sender_name=data.receivedName,
-            receiver_name=robot_id,
-            at_me=data.atMe,
-            text_type=data.textType,
-            raw_content=raw_content,
-            normalized_content=normalized,
-            provider_name=None,
-            status="received",
-        )
-
-        if data.textType != 1:
-            self._insert_decision(inbound_log_id, "skip", "NON_TEXT", "非文本消息不处理")
-            return
-
-        if scene == "group" and robot_cfg["group_chat_enabled"] == 0:
-            self._insert_decision(inbound_log_id, "skip", "GROUP_DISABLED", "群聊已禁用")
-            return
-
-        if scene == "private" and robot_cfg["private_chat_enabled"] == 0:
-            self._insert_decision(inbound_log_id, "skip", "PRIVATE_DISABLED", "私聊已禁用")
-            return
-
-        if scene == "group":
-            should_reply, reason_code, reason_text = await self._should_reply_group(robot_id, data, robot_cfg)
-            self._insert_decision(
-                inbound_log_id,
-                "reply" if should_reply else "skip",
-                reason_code,
-                reason_text,
+    timeout = aiohttp.ClientTimeout(total=30)
+    started = time.perf_counter()
+    logger.info(
+        "provider_request_start rule_id=%s provider_id=%s provider_name=%s url=%s auth_scheme=%s prompt=%s",
+        rule.get("id"),
+        rule.get("provider_id"),
+        rule.get("provider_name"),
+        url,
+        auth_scheme,
+        _short_text(prompt, 160),
+    )
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload, headers=headers) as resp:
+            raw = await resp.text()
+            if resp.status >= 400:
+                logger.warning(
+                    "provider_request_http_error rule_id=%s provider_id=%s status=%s cost_ms=%s body=%s",
+                    rule.get("id"),
+                    rule.get("provider_id"),
+                    resp.status,
+                    int((time.perf_counter() - started) * 1000),
+                    _short_text(raw, 300),
+                )
+                raise HTTPException(status_code=502, detail=f"provider upstream status={resp.status}")
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = raw
+            text = _extract_provider_text(data)
+            if not text:
+                logger.warning(
+                    "provider_request_empty_text rule_id=%s provider_id=%s cost_ms=%s body=%s",
+                    rule.get("id"),
+                    rule.get("provider_id"),
+                    int((time.perf_counter() - started) * 1000),
+                    _short_text(raw, 300),
+                )
+                raise HTTPException(status_code=502, detail="provider response has no text")
+            logger.info(
+                "provider_request_success rule_id=%s provider_id=%s cost_ms=%s reply=%s",
+                rule.get("id"),
+                rule.get("provider_id"),
+                int((time.perf_counter() - started) * 1000),
+                _short_text(text, 160),
             )
-            if not should_reply:
-                return
+            return text
 
-            content = normalized
-            if not content.strip():
-                content = self._find_last_user_message(robot_id, data.groupName or "", data.receivedName) or ""
-            if not content.strip():
-                content = "你好，请问有什么可以帮助你的吗？"
-            target = data.groupName or data.receivedName
-            provider_rule = self._find_provider_for_scene(robot_id, "group", data.groupName or "")
-        else:
-            self._insert_decision(inbound_log_id, "reply", "PRIVATE_DEFAULT", "私聊默认回复流程")
-            content = normalized
-            target = data.receivedName
-            provider_rule = self._find_provider_for_scene(robot_id, "private", data.receivedName)
 
-        reply_text: Optional[str] = None
-        provider_name: Optional[str] = None
-        if provider_rule:
-            provider_name = provider_rule["provider_name"]
-            reply_text = await self._call_provider(
-                provider_type=provider_rule["provider_type"],
-                provider_name=provider_rule["provider_name"],
-                base_url=provider_rule["base_url"],
-                token=provider_rule["api_token"],
-                model=provider_rule["model"],
-                auth_scheme=provider_rule["auth_scheme"],
-                extra_json=provider_rule["extra_json"],
-                robot_id=robot_id,
-                group_name=data.groupName,
-                received_name=data.receivedName,
-                messages=[{"role": "user", "content": content}],
+async def _send_worktool_text(robot_id: str, scene: str, req: QARequest, text: str) -> Dict[str, Any]:
+    target = _rule_match_target(scene, req)
+    if not target:
+        raise HTTPException(status_code=400, detail="worktool target empty")
+    url = f"{get_worktool_api_base()}/wework/sendRawMessage"
+    payload = {
+        "socketType": 2,
+        "list": [
+            {
+                "type": 203,
+                "titleList": [target],
+                "receivedContent": text,
+            }
+        ],
+    }
+    started = time.perf_counter()
+    logger.info(
+        "worktool_send_start robot_id=%s scene=%s target=%s text=%s",
+        robot_id,
+        scene,
+        _short_text(target, 80),
+        _short_text(text, 160),
+    )
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, params={"robotId": robot_id}, json=payload) as resp:
+            raw = await resp.text()
+            if resp.status >= 400:
+                logger.warning(
+                    "worktool_send_http_error robot_id=%s status=%s cost_ms=%s body=%s",
+                    robot_id,
+                    resp.status,
+                    int((time.perf_counter() - started) * 1000),
+                    _short_text(raw, 300),
+                )
+                raise HTTPException(status_code=502, detail=f"worktool sendRawMessage status={resp.status}")
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {"raw": raw}
+            code = str((data or {}).get("code", ""))
+            if code not in {"0", "200", ""}:
+                msg = (data or {}).get("message") or (data or {}).get("msg") or "unknown"
+                logger.warning(
+                    "worktool_send_business_error robot_id=%s code=%s cost_ms=%s msg=%s body=%s",
+                    robot_id,
+                    code,
+                    int((time.perf_counter() - started) * 1000),
+                    _short_text(str(msg), 160),
+                    _short_text(raw, 300),
+                )
+                raise HTTPException(status_code=502, detail=f"worktool sendRawMessage failed: {msg} (code={code})")
+            logger.info(
+                "worktool_send_success robot_id=%s cost_ms=%s code=%s",
+                robot_id,
+                int((time.perf_counter() - started) * 1000),
+                code or "0",
             )
-            if reply_text:
-                reply_text = reply_text.strip()
-
-        if not reply_text:
-            default = self._get_default_reply(robot_id, scene)
-            if default:
-                reply_text = default
-                provider_name = provider_name or "default_reply"
-
-        if not reply_text:
-            self._insert_message_log(
-                robot_id=robot_id,
-                direction="outbound",
-                scene=scene,
-                group_name=data.groupName,
-                sender_name=robot_id,
-                receiver_name=target,
-                at_me=None,
-                text_type=1,
-                raw_content="",
-                normalized_content="",
-                provider_name=provider_name,
-                status="skipped",
-                error_message="no rule matched and no default reply",
-            )
-            return
-
-        ok, err = await self._send_raw_message(
-            get_default_message_api_url(),
-            robot_id,
-            [{"type": 203, "titleList": [target], "receivedContent": reply_text}],
-        )
-        self._insert_message_log(
-            robot_id=robot_id,
-            direction="outbound",
-            scene=scene,
-            group_name=data.groupName,
-            sender_name=robot_id,
-            receiver_name=target,
-            at_me=None,
-            text_type=1,
-            raw_content=reply_text,
-            normalized_content=reply_text,
-            provider_name=provider_name,
-            status="success" if ok else "failed",
-            error_message=err if not ok else None,
-        )
+            return data if isinstance(data, dict) else {"raw": raw}
 
 
-app = FastAPI(title="WorkTool Bot Console API", version=APP_VERSION)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-logger = logging.getLogger("backend")
-processor = MessageProcessor()
-
-
+# ----- lifecycle -----
 @app.on_event("startup")
 async def startup() -> None:
     init_db()
-    import_config_json_if_needed()
-    level = get_setting("log_level", "INFO").upper()
-    logging.getLogger().setLevel(getattr(logging, level, logging.INFO))
-    logger.info("backend started, db=%s", DB_PATH)
+    logger.info("backend started")
 
 
-@app.get("/api/v1/health")
-async def health() -> Dict[str, Any]:
+# ----- auth -----
+@app.post("/api/v1/auth/sms/send")
+async def auth_sms_send(body: SmsSendRequest, request: Request) -> Dict[str, Any]:
+    if not AUTH_SMS_ENABLED:
+        raise HTTPException(status_code=404, detail="sms auth disabled")
+    phone = (body.phone or "").strip()
+    if not _is_valid_phone(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不合法")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT created_at FROM sms_codes WHERE phone=%s AND scene=%s ORDER BY id DESC LIMIT 1",
+                (phone, body.scene),
+            )
+            latest = cur.fetchone()
+            if latest and isinstance(latest.get("created_at"), datetime):
+                if (datetime.utcnow() - latest["created_at"]).total_seconds() < 60:
+                    raise HTTPException(status_code=429, detail="发送过于频繁，请稍后再试")
+
+            cur.execute(
+                """
+                SELECT COUNT(1) AS c FROM sms_codes
+                WHERE phone=%s AND scene=%s AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)
+                """,
+                (phone, body.scene),
+            )
+            c = int((cur.fetchone() or {}).get("c") or 0)
+            if c >= 5:
+                raise HTTPException(status_code=429, detail="1小时内发送次数已达上限")
+
+        code = f"{secrets.randbelow(1000000):06d}"
+        content = f"{SMS_HUARUI_SIGN}您好，您的验证码是：{code}，该验证码{SMS_CODE_EXPIRE_MINUTES}分钟内有效，请勿泄露。"
+        source_ip = (request.client.host if request.client else "") or ""
+
+        upstream_error = ""
+        sms_data: Dict[str, Any] = {}
+        try:
+            sms_data = await _send_sms_via_huarui(phone, content)
+        except Exception as e:
+            upstream_error = str(e)
+
+        sms_ok = str(sms_data.get("code") or "") == "00000"
+        sms_uid = str(sms_data.get("uid") or "-")
+        result_json = json.dumps(sms_data if sms_data else {"error": upstream_error}, ensure_ascii=False)[:1024]
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_sms_record(account, source, source_ip, phone, sign, content, send_time, msgid, result)
+                VALUES(%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(),%s,%s)
+                """,
+                (SMS_HUARUI_APPKEY or "-", f"auth:{body.scene}", source_ip, phone, SMS_HUARUI_SIGN, content[:512], sms_uid, result_json),
+            )
+            if sms_ok:
+                cur.execute(
+                    """
+                    INSERT INTO sms_codes(phone, scene, code_hash, expire_at, request_ip)
+                    VALUES(%s,%s,%s,DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s MINUTE),%s)
+                    """,
+                    (phone, body.scene, _hash_sms_code(code), SMS_CODE_EXPIRE_MINUTES, source_ip),
+                )
+        conn.commit()
+        if not sms_ok:
+            raise HTTPException(status_code=502, detail="短信发送失败")
+        return {"ok": True, "message": "验证码已发送"}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/auth/register")
+async def auth_register(body: AuthRegisterRequest) -> Dict[str, Any]:
+    phone = (body.phone or "").strip()
+    code = (body.sms_code or "").strip()
+    password = body.password or ""
+    company_name = (body.company_name or "").strip() or None
+
+    if not _is_valid_phone(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不合法")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="密码长度至少8位")
+    if AUTH_SMS_ENABLED and not re.fullmatch(r"\d{6}", code):
+        raise HTTPException(status_code=400, detail="验证码格式不合法")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE phone=%s LIMIT 1", (phone,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail="手机号已注册")
+
+            if AUTH_SMS_ENABLED:
+                ok = _consume_sms_code(cur, phone, "register", code)
+                if not ok:
+                    raise HTTPException(status_code=400, detail="验证码错误或已过期")
+
+            cur.execute(
+                "INSERT INTO users(phone,password_hash,company_name,token_version,is_active) VALUES(%s,%s,%s,0,1)",
+                (phone, _hash_password(password), company_name),
+            )
+            user_id = int(cur.lastrowid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    token = _create_access_token(user_id, 0)
     return {
-        "status": "healthy",
-        "version": APP_VERSION,
-        "time": now_iso(),
-        "enable_troubleshoot": ENABLE_TROUBLESHOOT,
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in_days": AUTH_JWT_EXPIRE_DAYS,
+        "user": {"id": user_id, "phone": phone, "company_name": company_name},
     }
 
 
+@app.post("/api/v1/auth/login")
+async def auth_login(body: AuthLoginRequest) -> Dict[str, Any]:
+    phone = (body.phone or "").strip()
+    password = body.password or ""
+    if not _is_valid_phone(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不合法")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id,phone,company_name,password_hash,token_version,is_active FROM users WHERE phone=%s LIMIT 1",
+                (phone,),
+            )
+            user = cur.fetchone()
+            if not user or int(user["is_active"]) != 1 or not _verify_password(password, str(user["password_hash"])):
+                raise HTTPException(status_code=401, detail="手机号或密码错误")
+            cur.execute("UPDATE users SET last_login_at=UTC_TIMESTAMP() WHERE id=%s", (int(user["id"]),))
+        conn.commit()
+        token = _create_access_token(int(user["id"]), int(user["token_version"]))
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in_days": AUTH_JWT_EXPIRE_DAYS,
+            "user": {
+                "id": int(user["id"]),
+                "phone": user["phone"],
+                "company_name": user["company_name"],
+                "is_admin": _is_admin_phone(str(user["phone"])),
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/auth/password/reset")
+async def auth_reset_password(body: AuthResetPasswordRequest) -> Dict[str, Any]:
+    if not AUTH_SMS_ENABLED:
+        raise HTTPException(status_code=404, detail="password reset disabled")
+    phone = (body.phone or "").strip()
+    code = (body.sms_code or "").strip()
+    new_password = body.new_password or ""
+    if not _is_valid_phone(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不合法")
+    if not re.fullmatch(r"\d{6}", code):
+        raise HTTPException(status_code=400, detail="验证码格式不合法")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="密码长度至少8位")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE phone=%s LIMIT 1", (phone,))
+            user = cur.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            ok = _consume_sms_code(cur, phone, "reset_password", code)
+            if not ok:
+                raise HTTPException(status_code=400, detail="验证码错误或已过期")
+
+            cur.execute(
+                "UPDATE users SET password_hash=%s, token_version=token_version+1 WHERE id=%s",
+                (_hash_password(new_password), int(user["id"])),
+            )
+        conn.commit()
+        return {"ok": True, "message": "密码已重置"}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/auth/logout-all")
+async def auth_logout_all(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET token_version=token_version+1 WHERE id=%s", (int(user["id"]),))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "message": "已退出所有设备"}
+
+
+@app.get("/api/v1/auth/me")
+async def auth_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    return {
+        "id": int(user["id"]),
+        "phone": user["phone"],
+        "company_name": user["company_name"],
+        "is_active": bool(user["is_active"]),
+        "is_admin": _is_admin_phone(str(user["phone"])),
+        "last_login_at": str(user["last_login_at"]) if user.get("last_login_at") else None,
+        "created_at": str(user["created_at"]),
+        "updated_at": str(user["updated_at"]),
+    }
+
+
+@app.get("/api/v1/auth/config")
+async def auth_config() -> Dict[str, Any]:
+    return {
+        "sms_auth_enabled": AUTH_SMS_ENABLED,
+        "password_reset_enabled": AUTH_SMS_ENABLED,
+    }
+
+
+# ----- basic -----
+@app.get("/api/v1/health")
+async def health() -> Dict[str, Any]:
+    return {"status": "healthy", "version": APP_VERSION, "time": now_iso(), "enable_troubleshoot": ENABLE_TROUBLESHOOT}
+
+
 @app.get("/api/v1/settings/worktool")
-async def get_worktool_settings() -> Dict[str, Any]:
+async def get_worktool_settings(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _ = user
     base = get_worktool_api_base()
     callback_public_base_url = get_callback_public_base_url()
     return {
         "worktool_api_base": base,
         "callback_public_base_url": callback_public_base_url,
-        "auto_bind_message_callback_on_create": parse_bool(
-            get_setting("auto_bind_message_callback_on_create", "true"),
-            True,
-        ),
+        "auto_bind_message_callback_on_create": parse_bool(get_setting("auto_bind_message_callback_on_create", "true"), True),
+        "runtime_editable": ENABLE_RUNTIME_WORKTOOL_SETTINGS,
         "message_send_api_url": f"{base}/wework/sendRawMessage",
         "callback_example_url": (
-            f"{callback_public_base_url}/api/v1/callback/qa/{{robot_id}}"
-            if callback_public_base_url
-            else ""
+            f"{callback_public_base_url}/api/v1/callback/qa/{{robot_id}}" if callback_public_base_url else ""
         ),
     }
 
 
 @app.put("/api/v1/settings/worktool")
-async def update_worktool_settings(body: WorkToolSettingsUpdate) -> Dict[str, Any]:
+async def update_worktool_settings(body: WorkToolSettingsUpdate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _ = user
+    if not ENABLE_RUNTIME_WORKTOOL_SETTINGS:
+        raise HTTPException(status_code=403, detail="runtime worktool settings disabled")
     if body.worktool_api_base is not None:
-        base = normalize_worktool_api_base(body.worktool_api_base)
-        set_setting("worktool_api_base", base)
-        set_setting("default_message_api_url", f"{base}/wework/sendRawMessage")
-        write_audit("update", "app_settings", "worktool_api_base", base)
-    else:
-        base = get_worktool_api_base()
-
+        set_setting("worktool_api_base", normalize_worktool_api_base(body.worktool_api_base))
     if body.callback_public_base_url is not None:
-        callback_public_base_url = normalize_public_base_url(body.callback_public_base_url)
-        set_setting("callback_public_base_url", callback_public_base_url)
-        write_audit("update", "app_settings", "callback_public_base_url", callback_public_base_url)
-    else:
-        callback_public_base_url = get_callback_public_base_url()
-
+        set_setting("callback_public_base_url", normalize_public_base_url(body.callback_public_base_url))
     if body.auto_bind_message_callback_on_create is not None:
-        auto_bind = bool(body.auto_bind_message_callback_on_create)
-        set_setting("auto_bind_message_callback_on_create", "true" if auto_bind else "false")
-        write_audit("update", "app_settings", "auto_bind_message_callback_on_create", str(auto_bind))
-    else:
-        auto_bind = parse_bool(get_setting("auto_bind_message_callback_on_create", "true"), True)
-
-    return {
-        "ok": True,
-        "worktool_api_base": base,
-        "callback_public_base_url": callback_public_base_url,
-        "auto_bind_message_callback_on_create": auto_bind,
-        "message_send_api_url": f"{base}/wework/sendRawMessage",
-        "callback_example_url": (
-            f"{callback_public_base_url}/api/v1/callback/qa/{{robot_id}}"
-            if callback_public_base_url
-            else ""
-        ),
-    }
-
-
-@app.get("/api/v1/settings/callback-base-suggestions")
-async def get_callback_base_suggestions(request: Request) -> Dict[str, Any]:
-    scheme = _detect_request_scheme(request)
-    host = _detect_request_host(request)
-    current_request_base = f"{scheme}://{host}" if host else ""
-
-    host_without_port, host_port = _split_host_port(host)
-    if not host_port:
-        host_port = "443" if scheme == "https" else "80"
-
-    public_ip = await _detect_public_ip()
-    public_base = f"{scheme}://{public_ip}:{host_port}" if public_ip else ""
-    local_ips = _detect_local_ips()
-    intranet_bases = [f"{scheme}://{ip}:{host_port}" for ip in local_ips]
-
-    current_is_domain = _is_domain_host(host_without_port)
-    current_is_global_ip = _is_global_ip_host(host_without_port)
-    suggested_base = ""
-    if current_request_base and (current_is_domain or current_is_global_ip):
-        suggested_base = current_request_base
-    elif public_base:
-        suggested_base = public_base
-    elif intranet_bases:
-        suggested_base = intranet_bases[0]
-
-    return {
-        "current_request_base": current_request_base,
-        "public_base": public_base,
-        "intranet_bases": intranet_bases,
-        "suggested_base": suggested_base,
-    }
-
-
-@app.post("/api/v1/callback/qa/{robot_id}", response_model=QAResponse)
-async def qa_callback(robot_id: str, req: QARequest) -> QAResponse:
-    asyncio.create_task(processor.process_message(robot_id, req))
-    return QAResponse(code=0, message="参数接收成功")
-
-
-def _resolve_openclaw_provider(robot_id: str, payload: OpenClawPushPayload) -> sqlite3.Row:
-    conn = get_conn()
-    try:
-        if payload.provider_id is not None:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM ai_providers
-                WHERE id = ? AND provider_type = 'openclaw' AND enabled = 1
-                """,
-                (payload.provider_id,),
-            ).fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="provider_id 不存在或未启用")
-            return row
-
-        if payload.provider_name:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM ai_providers
-                WHERE name = ? AND provider_type = 'openclaw' AND enabled = 1
-                LIMIT 1
-                """,
-                (payload.provider_name,),
-            ).fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="provider_name 不存在或未启用")
-            return row
-
-        # 优先按该机器人的规则中实际引用的 openclaw provider 反查，避免要求 OpenClaw 侧配置 provider_name
-        try:
-            rule_rows = conn.execute(
-                """
-                SELECT DISTINCT p.*
-                FROM rules r
-                JOIN ai_providers p ON p.id = r.provider_id
-                WHERE r.robot_id = ? AND r.enabled = 1 AND p.provider_type = 'openclaw' AND p.enabled = 1
-                ORDER BY p.id ASC
-                """,
-                (robot_id,),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # 兼容旧库：历史版本可能不存在 rules 表，回退到全局 provider 解析
-            rule_rows = []
-        if len(rule_rows) == 1:
-            return rule_rows[0]
-        if len(rule_rows) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail="该机器人关联了多个 openclaw provider，请在请求中指定 provider_id",
-            )
-
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM ai_providers
-            WHERE provider_type = 'openclaw' AND enabled = 1
-            ORDER BY id ASC
-            """,
-        ).fetchall()
-        if not rows:
-            raise HTTPException(status_code=404, detail="未配置启用中的 openclaw provider")
-        if len(rows) > 1:
-            raise HTTPException(status_code=400, detail="存在多个 openclaw provider，请指定 provider_id 或 provider_name")
-        return rows[0]
-    finally:
-        conn.close()
-
-
-def _build_worktool_message_list(items: List[OpenClawPushItem]) -> List[Dict[str, Any]]:
-    if not items:
-        raise HTTPException(status_code=400, detail="list 不能为空")
-    result: List[Dict[str, Any]] = []
-    for idx, item in enumerate(items, start=1):
-        if item.type == 203:
-            if not (item.content or "").strip():
-                raise HTTPException(status_code=400, detail=f"第{idx}条消息缺少 content")
-            result.append(
-                {
-                    "type": 203,
-                    "titleList": [item.receiver],
-                    "receivedContent": item.content.strip(),
-                }
-            )
-        elif item.type == 218:
-            if not item.object_name or not item.file_url:
-                raise HTTPException(status_code=400, detail=f"第{idx}条文件消息缺少 object_name/file_url")
-            result.append(
-                {
-                    "type": 218,
-                    "titleList": [item.receiver],
-                    "objectName": item.object_name,
-                    "fileUrl": item.file_url,
-                    "fileType": item.file_type or "image",
-                    "extraText": item.extra_text or "",
-                }
-            )
-        else:
-            raise HTTPException(status_code=400, detail=f"第{idx}条消息 type={item.type} 暂不支持")
-    return result
-
-
-@app.post("/api/v1/openclaw/push/{robot_id}")
-async def openclaw_push(robot_id: str, body: OpenClawPushPayload) -> Dict[str, Any]:
-    provider = _resolve_openclaw_provider(robot_id, body)
-
-    conn = get_conn()
-    robot = conn.execute("SELECT * FROM robots WHERE robot_id = ?", (robot_id,)).fetchone()
-    conn.close()
-    if not robot:
-        raise HTTPException(status_code=404, detail="robot not found")
-    message_list = _build_worktool_message_list(body.list)
-    ok, err = await processor._send_raw_message(get_default_message_api_url(), robot_id, message_list)
-    if not ok:
-        raise HTTPException(status_code=400, detail=f"下发失败：{err}")
-    return {"ok": True, "provider_id": provider["id"], "sent_count": len(message_list)}
+        set_setting("auto_bind_message_callback_on_create", "true" if body.auto_bind_message_callback_on_create else "false")
+    return await get_worktool_settings()
 
 
 @app.get("/api/v1/dashboard/overview")
-async def dashboard_overview() -> Dict[str, Any]:
-    conn = get_conn()
-    today = datetime.now().strftime("%Y-%m-%d")
-    robots_total = conn.execute("SELECT COUNT(1) AS c FROM robots").fetchone()["c"]
-    inbound_today = conn.execute(
-        "SELECT COUNT(1) AS c FROM message_logs WHERE direction='inbound' AND date(created_at)=?",
-        (today,),
-    ).fetchone()["c"]
-    outbound_success_today = conn.execute(
-        "SELECT COUNT(1) AS c FROM message_logs WHERE direction='outbound' AND status='success' AND date(created_at)=?",
-        (today,),
-    ).fetchone()["c"]
-    outbound_fail_today = conn.execute(
-        "SELECT COUNT(1) AS c FROM message_logs WHERE direction='outbound' AND status='failed' AND date(created_at)=?",
-        (today,),
-    ).fetchone()["c"]
-    conn.close()
+async def dashboard_overview(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    uid = int(user["id"])
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(1) AS c FROM user_robots WHERE user_id=%s", (uid,))
+            robots_total = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM message_logs ml
+                JOIN user_robots ur ON ur.robot_pk=ml.robot_pk
+                WHERE ur.user_id=%s AND DATE(ml.created_at)=UTC_DATE() AND ml.direction='inbound'
+                """,
+                (uid,),
+            )
+            inbound_today = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM message_logs ml
+                JOIN user_robots ur ON ur.robot_pk=ml.robot_pk
+                WHERE ur.user_id=%s AND DATE(ml.created_at)=UTC_DATE() AND ml.direction='outbound' AND ml.status='success'
+                """,
+                (uid,),
+            )
+            outbound_success_today = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM message_logs ml
+                JOIN user_robots ur ON ur.robot_pk=ml.robot_pk
+                WHERE ur.user_id=%s AND DATE(ml.created_at)=UTC_DATE() AND ml.direction='outbound' AND ml.status='failed'
+                """,
+                (uid,),
+            )
+            outbound_fail_today = int((cur.fetchone() or {}).get("c") or 0)
+    finally:
+        conn.close()
 
     reply_rate = (outbound_success_today / inbound_today) if inbound_today else 0
     fail_rate = (outbound_fail_today / (outbound_success_today + outbound_fail_today)) if (outbound_success_today + outbound_fail_today) else 0
@@ -1567,436 +1388,469 @@ async def dashboard_overview() -> Dict[str, Any]:
 
 
 @app.get("/api/v1/dashboard/trends")
-async def dashboard_trends(days: int = Query(default=7, ge=1, le=90)) -> Dict[str, Any]:
-    conn = get_conn()
-    items: List[Dict[str, Any]] = []
-    for i in range(days - 1, -1, -1):
-        d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-        inbound = conn.execute(
-            "SELECT COUNT(1) AS c FROM message_logs WHERE direction='inbound' AND date(created_at)=?",
-            (d,),
-        ).fetchone()["c"]
-        outbound = conn.execute(
-            "SELECT COUNT(1) AS c FROM message_logs WHERE direction='outbound' AND status='success' AND date(created_at)=?",
-            (d,),
-        ).fetchone()["c"]
-        items.append({"date": d, "inbound": inbound, "outbound_success": outbound})
-    conn.close()
-    return {"days": days, "items": items}
+async def dashboard_trends(days: int = Query(default=7, ge=1, le=90), user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    uid = int(user["id"])
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=days - 1)
+    items: Dict[str, Dict[str, Any]] = {}
+    for i in range(days):
+        d = start + timedelta(days=i)
+        k = d.strftime("%Y-%m-%d")
+        items[k] = {"date": k, "inbound": 0, "outbound_success": 0}
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DATE(ml.created_at) AS d, ml.direction, ml.status, COUNT(1) AS c
+                FROM message_logs ml
+                JOIN user_robots ur ON ur.robot_pk=ml.robot_pk
+                WHERE ur.user_id=%s AND DATE(ml.created_at) BETWEEN %s AND %s
+                GROUP BY DATE(ml.created_at), ml.direction, ml.status
+                """,
+                (uid, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+            )
+            rows = cur.fetchall() or []
+    finally:
+        conn.close()
+
+    for row in rows:
+        key = str(row.get("d"))
+        if key not in items:
+            continue
+        c = int(row.get("c") or 0)
+        if row.get("direction") == "inbound":
+            items[key]["inbound"] += c
+        elif row.get("direction") == "outbound" and row.get("status") == "success":
+            items[key]["outbound_success"] += c
+    return {"days": days, "items": [items[k] for k in sorted(items.keys())]}
+
+
+# ----- robots/providers/rules -----
+@app.get("/api/v1/robots")
+async def list_robots(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.* FROM robots r
+                JOIN user_robots ur ON ur.robot_pk=r.id
+                WHERE ur.user_id=%s
+                ORDER BY r.id ASC
+                """,
+                (int(user["id"]),),
+            )
+            rows = cur.fetchall() or []
+            items = []
+            for row in rows:
+                row["private_chat_enabled"] = bool(row["private_chat_enabled"])
+                row["group_chat_enabled"] = bool(row["group_chat_enabled"])
+                row["group_reply_only_when_mentioned"] = bool(row["group_reply_only_when_mentioned"])
+                items.append(row)
+            return {"items": items}
+    finally:
+        conn.close()
 
 
 @app.get("/api/v1/robots/{robot_id}")
-async def get_robot(robot_id: str) -> Dict[str, Any]:
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM robots WHERE robot_id = ?", (robot_id,)).fetchone()
-    if not row:
+async def get_robot(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    row = _require_robot_access(int(user["id"]), robot_id)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT scene,reply_text FROM default_replies WHERE robot_pk=%s", (int(row["id"]),))
+            defaults = cur.fetchall() or []
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="robot not found")
-    defaults = conn.execute(
-        "SELECT scene, reply_text FROM default_replies WHERE robot_id = ?",
-        (robot_id,),
-    ).fetchall()
-    conn.close()
-    payload = dict(row)
-    payload["private_chat_enabled"] = bool(row["private_chat_enabled"])
-    payload["group_chat_enabled"] = bool(row["group_chat_enabled"])
-    payload["group_reply_only_when_mentioned"] = bool(row["group_reply_only_when_mentioned"])
-    payload["defaults"] = {d["scene"]: d["reply_text"] for d in defaults}
-    return payload
+    row["private_chat_enabled"] = bool(row["private_chat_enabled"])
+    row["group_chat_enabled"] = bool(row["group_chat_enabled"])
+    row["group_reply_only_when_mentioned"] = bool(row["group_reply_only_when_mentioned"])
+    row["defaults"] = {x["scene"]: x["reply_text"] for x in defaults}
+    return row
 
 
 @app.post("/api/v1/robots")
-async def create_robot(body: RobotCreate) -> Dict[str, Any]:
-    if not ENABLE_ROBOT_CREATE:
-        raise HTTPException(status_code=403, detail="未开放创建机器人：请先完成登录体系后再启用")
-    robot_id = (body.robot_id or "").strip()
-    if not robot_id:
+async def create_robot(body: RobotCreate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    rid = (body.robot_id or "").strip()
+    if not rid:
         raise HTTPException(status_code=400, detail="robot_id required")
 
-    exists_conn = get_conn()
-    exists_row = exists_conn.execute("SELECT 1 FROM robots WHERE robot_id = ?", (robot_id,)).fetchone()
-    exists_conn.close()
-    if exists_row:
-        write_audit("attach", "robot", robot_id, "attach existing robot")
-        return {
-            "ok": True,
-            "existed": True,
-            "auto_bind_message_callback": False,
-            "callback_url": "",
-        }
-
-    conn = get_conn()
-    now = now_iso()
-    try:
-        conn.execute(
-            """
-            INSERT INTO robots(
-                robot_id, name, private_chat_enabled, group_chat_enabled,
-                group_reply_only_when_mentioned, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                robot_id,
-                (body.name or "机器人").strip() or "机器人",
-                1 if body.private_chat_enabled else 0,
-                1 if body.group_chat_enabled else 0,
-                1 if body.group_reply_only_when_mentioned else 0,
-                now,
-                now,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
-            VALUES (?, 'group', ?, ?)
-            """,
-            (robot_id, body.group_default_reply, now),
-        )
-        conn.execute(
-            """
-            INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
-            VALUES (?, 'private', ?, ?)
-            """,
-            (robot_id, body.private_default_reply, now),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError as e:
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"create robot failed: {e}") from e
-    conn.close()
-
     auto_bind = parse_bool(get_setting("auto_bind_message_callback_on_create", "true"), True)
-    callback_url = build_robot_callback_url(robot_id)
-    if auto_bind:
-        if not callback_url:
-            rollback_conn = get_conn()
-            rollback_conn.execute("DELETE FROM robots WHERE robot_id = ?", (robot_id,))
-            rollback_conn.commit()
-            rollback_conn.close()
-            raise HTTPException(
-                status_code=400,
-                detail="create robot failed: 已回滚。自动绑定消息回调失败：未配置“回调公网基础地址”。",
-            )
-        try:
-            await bind_message_callback(robot_id, callback_url, 1)
-        except HTTPException as e:
-            rollback_conn = get_conn()
-            rollback_conn.execute("DELETE FROM robots WHERE robot_id = ?", (robot_id,))
-            rollback_conn.commit()
-            rollback_conn.close()
-            raise HTTPException(
-                status_code=400,
-                detail=f"create robot failed: 已回滚。自动绑定消息回调失败：{e.detail}",
-            ) from e
+    callback_url = build_robot_callback_url(rid)
+    if auto_bind and not callback_url:
+        raise HTTPException(status_code=400, detail="create robot failed: 自动绑定消息回调失败：未配置“回调公网基础地址”。")
 
-    write_audit("create", "robot", robot_id, "create robot")
-    return {
-        "ok": True,
-        "existed": False,
-        "auto_bind_message_callback": auto_bind,
-        "callback_url": callback_url if auto_bind else "",
-    }
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM robots WHERE robot_id=%s LIMIT 1", (rid,))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    "INSERT INTO user_robots(user_id,robot_pk) VALUES(%s,%s) ON DUPLICATE KEY UPDATE robot_pk=robot_pk",
+                    (int(user["id"]), int(row["id"])),
+                )
+                conn.commit()
+                return {"ok": True, "existed": True, "auto_bind_message_callback": False, "callback_url": ""}
+
+            cur.execute(
+                """
+                INSERT INTO robots(robot_id,name,private_chat_enabled,group_chat_enabled,group_reply_only_when_mentioned,created_by)
+                VALUES(%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    rid,
+                    (body.name or "机器人").strip() or "机器人",
+                    1 if body.private_chat_enabled else 0,
+                    1 if body.group_chat_enabled else 0,
+                    1 if body.group_reply_only_when_mentioned else 0,
+                    int(user["id"]),
+                ),
+            )
+            robot_pk = int(cur.lastrowid)
+            cur.execute(
+                "INSERT INTO default_replies(robot_pk,scene,reply_text) VALUES(%s,'group',%s) ON DUPLICATE KEY UPDATE reply_text=VALUES(reply_text)",
+                (robot_pk, body.group_default_reply),
+            )
+            cur.execute(
+                "INSERT INTO default_replies(robot_pk,scene,reply_text) VALUES(%s,'private',%s) ON DUPLICATE KEY UPDATE reply_text=VALUES(reply_text)",
+                (robot_pk, body.private_default_reply),
+            )
+            cur.execute("INSERT INTO user_robots(user_id,robot_pk) VALUES(%s,%s)", (int(user["id"]), robot_pk))
+        if auto_bind:
+            await bind_message_callback(rid, callback_url, 1)
+        conn.commit()
+        return {"ok": True, "existed": False, "auto_bind_message_callback": auto_bind, "callback_url": callback_url if auto_bind else ""}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 @app.put("/api/v1/robots/{robot_id}")
-async def update_robot(robot_id: str, body: RobotUpdate) -> Dict[str, Any]:
-    updates = []
+async def update_robot(robot_id: str, body: RobotUpdate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    robot = _require_robot_access(int(user["id"]), robot_id)
+    updates: List[str] = []
     params: List[Any] = []
     if body.name is not None:
-        updates.append("name = ?")
+        updates.append("name=%s")
         params.append(body.name)
     if body.private_chat_enabled is not None:
-        updates.append("private_chat_enabled = ?")
+        updates.append("private_chat_enabled=%s")
         params.append(1 if body.private_chat_enabled else 0)
     if body.group_chat_enabled is not None:
-        updates.append("group_chat_enabled = ?")
+        updates.append("group_chat_enabled=%s")
         params.append(1 if body.group_chat_enabled else 0)
     if body.group_reply_only_when_mentioned is not None:
-        updates.append("group_reply_only_when_mentioned = ?")
+        updates.append("group_reply_only_when_mentioned=%s")
         params.append(1 if body.group_reply_only_when_mentioned else 0)
 
-    conn = get_conn()
-    if updates:
-        updates.append("updated_at = ?")
-        params.append(now_iso())
-        params.append(robot_id)
-        conn.execute(f"UPDATE robots SET {', '.join(updates)} WHERE robot_id = ?", params)
-
-    if body.group_default_reply is not None:
-        conn.execute(
-            """
-            INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
-            VALUES (?, 'group', ?, ?)
-            ON CONFLICT(robot_id, scene) DO UPDATE SET reply_text=excluded.reply_text, updated_at=excluded.updated_at
-            """,
-            (robot_id, body.group_default_reply, now_iso()),
-        )
-    if body.private_default_reply is not None:
-        conn.execute(
-            """
-            INSERT INTO default_replies(robot_id, scene, reply_text, updated_at)
-            VALUES (?, 'private', ?, ?)
-            ON CONFLICT(robot_id, scene) DO UPDATE SET reply_text=excluded.reply_text, updated_at=excluded.updated_at
-            """,
-            (robot_id, body.private_default_reply, now_iso()),
-        )
-    conn.commit()
-    conn.close()
-    write_audit("update", "robot", robot_id, "update robot")
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            if updates:
+                params.append(int(robot["id"]))
+                cur.execute(f"UPDATE robots SET {', '.join(updates)} WHERE id=%s", tuple(params))
+            if body.group_default_reply is not None:
+                cur.execute(
+                    "INSERT INTO default_replies(robot_pk,scene,reply_text) VALUES(%s,'group',%s) ON DUPLICATE KEY UPDATE reply_text=VALUES(reply_text)",
+                    (int(robot["id"]), body.group_default_reply),
+                )
+            if body.private_default_reply is not None:
+                cur.execute(
+                    "INSERT INTO default_replies(robot_pk,scene,reply_text) VALUES(%s,'private',%s) ON DUPLICATE KEY UPDATE reply_text=VALUES(reply_text)",
+                    (int(robot["id"]), body.private_default_reply),
+                )
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.delete("/api/v1/robots/{robot_id}")
-async def delete_robot(robot_id: str) -> Dict[str, Any]:
-    conn = get_conn()
-    conn.execute("DELETE FROM robots WHERE robot_id = ?", (robot_id,))
-    conn.commit()
-    conn.close()
-    write_audit("delete", "robot", robot_id, "delete robot")
+async def delete_robot(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    robot = _require_robot_access(int(user["id"]), robot_id)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_robots WHERE user_id=%s AND robot_pk=%s", (int(user["id"]), int(robot["id"])))
+            cur.execute("SELECT COUNT(1) AS c FROM user_robots WHERE robot_pk=%s", (int(robot["id"]),))
+            remain = int((cur.fetchone() or {}).get("c") or 0)
+            if remain == 0:
+                cur.execute("DELETE FROM robots WHERE id=%s", (int(robot["id"]),))
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.get("/api/v1/providers")
-async def list_providers(robot_id: Optional[str] = None) -> Dict[str, Any]:
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM ai_providers ORDER BY id ASC").fetchall()
-    conn.close()
-    items = []
-    for row in rows:
-        d = dict(row)
-        d["enabled"] = bool(row["enabled"])
-        d["api_token_masked"] = mask_token(row["api_token"])
-        d.pop("api_token")
-        d.pop("robot_id", None)
-        items.append(d)
-    return {"items": items}
+async def list_providers(robot_id: Optional[str] = None, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _ = robot_id
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT p.*
+                FROM ai_providers p
+                LEFT JOIN routing_rules r ON r.provider_id=p.id
+                LEFT JOIN user_robots ur ON ur.robot_pk=r.robot_pk AND ur.user_id=%s
+                WHERE p.created_by=%s OR ur.user_id IS NOT NULL
+                ORDER BY p.id ASC
+                """,
+                (int(user["id"]), int(user["id"])),
+            )
+            rows = cur.fetchall() or []
+            items = []
+            for row in rows:
+                row["enabled"] = bool(row["enabled"])
+                row["api_token_masked"] = mask_token(str(row["api_token"]))
+                row.pop("api_token", None)
+                items.append(row)
+            return {"items": items}
+    finally:
+        conn.close()
 
 
 @app.post("/api/v1/providers")
-async def create_provider(body: ProviderCreate) -> Dict[str, Any]:
+async def create_provider(body: ProviderCreate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    extra = _normalize_extra_json(body.extra_json)
+
+    conn = db_conn()
     try:
-        normalized_extra_json = normalize_extra_json(body.extra_json)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    conn = get_conn()
-    try:
-        auth_scheme = resolve_auth_scheme(body.provider_type, body.auth_scheme)
-        exists = conn.execute("SELECT id FROM ai_providers WHERE name = ? LIMIT 1", (body.name,)).fetchone()
-        if exists:
-            raise HTTPException(status_code=400, detail="create provider failed: 名称已存在，请使用不同名称")
-        conn.execute(
-            """
-            INSERT INTO ai_providers(
-                robot_id, name, base_url, api_token, model, provider_type, auth_scheme, extra_json,
-                enabled, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "",
-                body.name,
-                body.base_url,
-                body.api_token,
-                body.model,
-                body.provider_type,
-                auth_scheme,
-                normalized_extra_json,
-                1 if body.enabled else 0,
-                now_iso(),
-                now_iso(),
-            ),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ai_providers(created_by,name,base_url,api_token,model,provider_type,auth_scheme,extra_json,enabled)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    int(user["id"]),
+                    body.name,
+                    body.base_url,
+                    body.api_token,
+                    body.model,
+                    body.provider_type,
+                    _resolve_auth_scheme(body.provider_type, body.auth_scheme),
+                    extra,
+                    1 if body.enabled else 0,
+                ),
+            )
         conn.commit()
-    except HTTPException:
-        conn.close()
-        raise
-    except sqlite3.IntegrityError as e:
-        conn.close()
+    except pymysql.err.IntegrityError as e:
         raise HTTPException(status_code=400, detail=f"create provider failed: {e}") from e
-    conn.close()
-    write_audit("create", "provider", body.name, "global provider")
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.put("/api/v1/providers/{provider_id}")
-async def update_provider(provider_id: int, body: ProviderUpdate) -> Dict[str, Any]:
-    updates = []
+async def update_provider(provider_id: int, body: ProviderUpdate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    if not _provider_owned_by_user(provider_id, int(user["id"])):
+        raise HTTPException(status_code=403, detail="无权修改该Provider")
+
+    updates: List[str] = []
     params: List[Any] = []
     if body.name is not None:
-        conn = get_conn()
-        dup = conn.execute(
-            "SELECT id FROM ai_providers WHERE name = ? AND id <> ? LIMIT 1",
-            (body.name, provider_id),
-        ).fetchone()
-        conn.close()
-        if dup:
-            raise HTTPException(status_code=400, detail="update provider failed: 名称已存在，请使用不同名称")
-        updates.append("name = ?")
+        updates.append("name=%s")
         params.append(body.name)
     if body.base_url is not None:
-        updates.append("base_url = ?")
+        updates.append("base_url=%s")
         params.append(body.base_url)
     if body.api_token is not None:
-        updates.append("api_token = ?")
+        updates.append("api_token=%s")
         params.append(body.api_token)
     if body.model is not None:
-        updates.append("model = ?")
+        updates.append("model=%s")
         params.append(body.model)
-    current_provider_type = body.provider_type
-    if body.provider_type is None and body.auth_scheme is None:
-        conn = get_conn()
-        row = conn.execute("SELECT provider_type FROM ai_providers WHERE id = ?", (provider_id,)).fetchone()
-        conn.close()
-        if row:
-            current_provider_type = row["provider_type"]
     if body.provider_type is not None:
-        updates.append("provider_type = ?")
+        updates.append("provider_type=%s")
         params.append(body.provider_type)
     if body.auth_scheme is not None:
-        updates.append("auth_scheme = ?")
+        updates.append("auth_scheme=%s")
         params.append(body.auth_scheme)
-    elif current_provider_type is not None:
-        updates.append("auth_scheme = ?")
-        params.append(resolve_auth_scheme(current_provider_type))
     if body.extra_json is not None:
-        try:
-            normalized_extra_json = normalize_extra_json(body.extra_json)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        updates.append("extra_json = ?")
-        params.append(normalized_extra_json)
+        updates.append("extra_json=%s")
+        params.append(_normalize_extra_json(body.extra_json))
     if body.enabled is not None:
-        updates.append("enabled = ?")
+        updates.append("enabled=%s")
         params.append(1 if body.enabled else 0)
     if not updates:
         return {"ok": True}
 
-    updates.append("updated_at = ?")
-    params.append(now_iso())
-    params.append(provider_id)
-    conn = get_conn()
-    conn.execute(f"UPDATE ai_providers SET {', '.join(updates)} WHERE id = ?", params)
-    conn.commit()
-    conn.close()
-    write_audit("update", "provider", str(provider_id), "update provider")
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            params.append(provider_id)
+            params.append(int(user["id"]))
+            cur.execute(f"UPDATE ai_providers SET {', '.join(updates)} WHERE id=%s AND created_by=%s", tuple(params))
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.delete("/api/v1/providers/{provider_id}")
-async def delete_provider(provider_id: int) -> Dict[str, Any]:
-    conn = get_conn()
-    conn.execute("DELETE FROM ai_providers WHERE id = ?", (provider_id,))
-    conn.commit()
-    conn.close()
-    write_audit("delete", "provider", str(provider_id), "delete provider")
+async def delete_provider(provider_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    if not _provider_owned_by_user(provider_id, int(user["id"])):
+        raise HTTPException(status_code=403, detail="无权删除该Provider")
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ai_providers WHERE id=%s AND created_by=%s", (provider_id, int(user["id"])))
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.get("/api/v1/robots/{robot_id}/rules")
-async def list_rules(robot_id: str, scene: Optional[str] = None) -> Dict[str, Any]:
-    sql = """
-        SELECT r.*, p.name AS provider_name
-        FROM routing_rules r
-        JOIN ai_providers p ON p.id = r.provider_id
-        WHERE r.robot_id = ?
-    """
-    params: List[Any] = [robot_id]
-    if scene:
-        sql += " AND r.scene = ?"
-        params.append(scene)
-    sql += " ORDER BY r.scene ASC, r.priority ASC, r.id ASC"
-    conn = get_conn()
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return {"items": [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]}
+async def list_rules(robot_id: str, scene: Optional[str] = None, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    robot = _require_robot_access(int(user["id"]), robot_id)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = (
+                "SELECT r.id,p.id AS provider_id,p.name AS provider_name,r.scene,r.pattern,r.priority,r.enabled "
+                "FROM routing_rules r JOIN ai_providers p ON p.id=r.provider_id WHERE r.robot_pk=%s"
+            )
+            params: List[Any] = [int(robot["id"])]
+            if scene:
+                sql += " AND r.scene=%s"
+                params.append(scene)
+            sql += " ORDER BY r.scene ASC, r.priority ASC, r.id ASC"
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall() or []
+            items = []
+            for row in rows:
+                items.append(
+                    {
+                        "id": int(row["id"]),
+                        "robot_id": robot_id,
+                        "scene": row["scene"],
+                        "pattern": row["pattern"],
+                        "provider_id": int(row["provider_id"]),
+                        "provider_name": row["provider_name"],
+                        "priority": int(row["priority"]),
+                        "enabled": bool(row["enabled"]),
+                    }
+                )
+            return {"items": items}
+    finally:
+        conn.close()
 
 
 @app.post("/api/v1/rules")
-async def create_rule(body: RuleCreate) -> Dict[str, Any]:
-    if body.scene not in {"group", "private"}:
-        raise HTTPException(status_code=400, detail="scene must be group/private")
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO routing_rules(
-            robot_id, scene, pattern, provider_id, priority, enabled, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            body.robot_id,
-            body.scene,
-            body.pattern,
-            body.provider_id,
-            body.priority,
-            1 if body.enabled else 0,
-            now_iso(),
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    write_audit("create", "rule", body.robot_id, body.pattern)
+async def create_rule(body: RuleCreate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    robot = _require_robot_access(int(user["id"]), body.robot_id)
+    if not _provider_accessible_by_user(body.provider_id, int(user["id"])):
+        raise HTTPException(status_code=403, detail="无权使用该Provider")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO routing_rules(robot_pk,scene,pattern,provider_id,priority,enabled)
+                VALUES(%s,%s,%s,%s,%s,%s)
+                """,
+                (int(robot["id"]), body.scene, body.pattern, body.provider_id, body.priority, 1 if body.enabled else 0),
+            )
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.put("/api/v1/rules/{rule_id}")
-async def update_rule(rule_id: int, body: RuleUpdate) -> Dict[str, Any]:
-    updates = []
-    params: List[Any] = []
-    if body.pattern is not None:
-        updates.append("pattern = ?")
-        params.append(body.pattern)
-    if body.provider_id is not None:
-        updates.append("provider_id = ?")
-        params.append(body.provider_id)
-    if body.priority is not None:
-        updates.append("priority = ?")
-        params.append(body.priority)
-    if body.enabled is not None:
-        updates.append("enabled = ?")
-        params.append(1 if body.enabled else 0)
-    if not updates:
-        return {"ok": True}
-    updates.append("updated_at = ?")
-    params.append(now_iso())
-    params.append(rule_id)
-    conn = get_conn()
-    conn.execute(f"UPDATE routing_rules SET {', '.join(updates)} WHERE id = ?", params)
-    conn.commit()
-    conn.close()
-    write_audit("update", "rule", str(rule_id), "update rule")
+async def update_rule(rule_id: int, body: RuleUpdate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id,r.robot_pk FROM routing_rules r
+                JOIN user_robots ur ON ur.robot_pk=r.robot_pk
+                WHERE r.id=%s AND ur.user_id=%s
+                LIMIT 1
+                """,
+                (rule_id, int(user["id"])),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=403, detail="无权修改该规则")
+
+            updates: List[str] = []
+            params: List[Any] = []
+            if body.pattern is not None:
+                updates.append("pattern=%s")
+                params.append(body.pattern)
+            if body.provider_id is not None:
+                if not _provider_accessible_by_user(body.provider_id, int(user["id"])):
+                    raise HTTPException(status_code=403, detail="无权使用该Provider")
+                updates.append("provider_id=%s")
+                params.append(body.provider_id)
+            if body.priority is not None:
+                updates.append("priority=%s")
+                params.append(body.priority)
+            if body.enabled is not None:
+                updates.append("enabled=%s")
+                params.append(1 if body.enabled else 0)
+            if updates:
+                params.append(rule_id)
+                cur.execute(f"UPDATE routing_rules SET {', '.join(updates)} WHERE id=%s", tuple(params))
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.delete("/api/v1/rules/{rule_id}")
-async def delete_rule(rule_id: int) -> Dict[str, Any]:
-    conn = get_conn()
-    conn.execute("DELETE FROM routing_rules WHERE id = ?", (rule_id,))
-    conn.commit()
-    conn.close()
-    write_audit("delete", "rule", str(rule_id), "delete rule")
+async def delete_rule(rule_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE r FROM routing_rules r
+                JOIN user_robots ur ON ur.robot_pk=r.robot_pk
+                WHERE r.id=%s AND ur.user_id=%s
+                """,
+                (rule_id, int(user["id"])),
+            )
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
 @app.put("/api/v1/robots/{robot_id}/rules/reorder")
-async def reorder_rules(robot_id: str, scene: str, body: ReorderPayload) -> Dict[str, Any]:
+async def reorder_rules(robot_id: str, scene: str, body: ReorderPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    robot = _require_robot_access(int(user["id"]), robot_id)
     if scene not in {"group", "private"}:
         raise HTTPException(status_code=400, detail="scene must be group/private")
-    conn = get_conn()
-    for idx, rule_id in enumerate(body.rule_ids, start=1):
-        conn.execute(
-            """
-            UPDATE routing_rules
-            SET priority = ?, updated_at = ?
-            WHERE id = ? AND robot_id = ? AND scene = ?
-            """,
-            (idx, now_iso(), rule_id, robot_id, scene),
-        )
-    conn.commit()
-    conn.close()
-    write_audit("reorder", "rule", robot_id, f"scene={scene}, count={len(body.rule_ids)}")
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            for idx, rule_id in enumerate(body.rule_ids, start=1):
+                cur.execute(
+                    "UPDATE routing_rules SET priority=%s WHERE id=%s AND robot_pk=%s AND scene=%s",
+                    (idx, rule_id, int(robot["id"]), scene),
+                )
+        conn.commit()
+    finally:
+        conn.close()
     return {"ok": True}
 
 
+# ----- compatible utility endpoints -----
 @app.get("/api/v1/logs/messages")
 async def list_message_logs(
     robot_id: Optional[str] = None,
@@ -2005,960 +1859,347 @@ async def list_message_logs(
     direction: Optional[str] = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
+    user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    where = []
-    params: List[Any] = []
-    if robot_id:
-        where.append("robot_id = ?")
-        params.append(robot_id)
-    if scene:
-        where.append("scene = ?")
-        params.append(scene)
-    if status:
-        where.append("status = ?")
-        params.append(status)
-    if direction:
-        where.append("direction = ?")
-        params.append(direction)
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["ur.user_id=%s"]
+            params: List[Any] = [int(user["id"])]
+            if robot_id:
+                where.append("r.robot_id=%s")
+                params.append(robot_id)
+            if scene:
+                where.append("ml.scene=%s")
+                params.append(scene)
+            if status:
+                where.append("ml.status=%s")
+                params.append(status)
+            if direction:
+                where.append("ml.direction=%s")
+                params.append(direction)
 
-    conn = get_conn()
-    total = conn.execute(f"SELECT COUNT(1) AS c FROM message_logs {where_clause}", params).fetchone()["c"]
-    offset = (page - 1) * page_size
-    rows = conn.execute(
-        f"""
-        SELECT *
-        FROM message_logs
-        {where_clause}
-        ORDER BY id DESC
-        LIMIT ? OFFSET ?
-        """,
-        [*params, page_size, offset],
-    ).fetchall()
-    conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+            where_sql = " AND ".join(where)
+            cur.execute(
+                f"""
+                SELECT COUNT(1) AS c
+                FROM message_logs ml
+                JOIN robots r ON r.id=ml.robot_pk
+                JOIN user_robots ur ON ur.robot_pk=r.id
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            offset = (page - 1) * page_size
+            cur.execute(
+                f"""
+                SELECT ml.id,r.robot_id,ml.direction,ml.scene,ml.normalized_content,ml.status,ml.created_at
+                FROM message_logs ml
+                JOIN robots r ON r.id=ml.robot_pk
+                JOIN user_robots ur ON ur.robot_pk=r.id
+                WHERE {where_sql}
+                ORDER BY ml.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params + [page_size, offset]),
+            )
+            items = cur.fetchall() or []
+            return {"items": items, "total": total, "page": page, "page_size": page_size}
+    finally:
+        conn.close()
 
 
 @app.get("/api/v1/logs/messages/{log_id}")
-async def get_message_log(log_id: int) -> Dict[str, Any]:
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM message_logs WHERE id = ?", (log_id,)).fetchone()
-    if not row:
+async def get_message_log(log_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ml.id,r.robot_id,ml.direction,ml.scene,ml.normalized_content,ml.status,ml.created_at
+                FROM message_logs ml
+                JOIN robots r ON r.id=ml.robot_pk
+                JOIN user_robots ur ON ur.robot_pk=r.id
+                WHERE ml.id=%s AND ur.user_id=%s
+                LIMIT 1
+                """,
+                (log_id, int(user["id"])),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="log not found")
+            return row
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="log not found")
-    decision = conn.execute(
-        "SELECT * FROM reply_decisions WHERE inbound_log_id = ? ORDER BY id DESC LIMIT 1",
-        (log_id,),
-    ).fetchone()
-    conn.close()
-    return {"log": dict(row), "decision": dict(decision) if decision else None}
 
 
-@app.get("/api/v1/logs/decisions")
-async def list_decisions(page: int = Query(default=1, ge=1), page_size: int = Query(default=20, ge=1, le=200)) -> Dict[str, Any]:
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(1) AS c FROM reply_decisions").fetchone()["c"]
-    rows = conn.execute(
-        """
-        SELECT d.*, m.robot_id, m.group_name, m.sender_name, m.normalized_content
-        FROM reply_decisions d
-        JOIN message_logs m ON m.id = d.inbound_log_id
-        ORDER BY d.id DESC
-        LIMIT ? OFFSET ?
-        """,
-        (page_size, (page - 1) * page_size),
-    ).fetchall()
-    conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+@app.post("/api/v1/callback/qa/{robot_id}", response_model=QAResponse)
+async def qa_callback(robot_id: str, req: QARequest) -> QAResponse:
+    robot = _get_robot_by_id_or_404(robot_id)
+    robot_pk = int(robot["id"])
+    scene = _scene_from_room_type(req.roomType)
+    inbound_text = _pick_inbound_text(req)
+    match_target = _rule_match_target(scene, req)
+    logger.info(
+        "qa_callback_received robot_id=%s robot_pk=%s scene=%s room_type=%s at_me=%s match_target=%s text=%s",
+        robot_id,
+        robot_pk,
+        scene,
+        req.roomType,
+        req.atMe,
+        _short_text(match_target, 120),
+        _short_text(inbound_text, 200),
+    )
 
+    _insert_message_log(robot_pk, "inbound", scene, inbound_text, "received")
 
-async def fetch_worktool_robot_info(path: str, robot_id: str) -> Dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=20)
-    url = f"{get_worktool_api_base()}{path}"
+    if scene == "private" and not bool(robot.get("private_chat_enabled")):
+        logger.info("qa_callback_skipped robot_id=%s reason=private_chat_disabled", robot_id)
+        _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
+        return QAResponse(code=0, message="参数接收成功")
+    if scene == "group":
+        if not bool(robot.get("group_chat_enabled")):
+            logger.info("qa_callback_skipped robot_id=%s reason=group_chat_disabled", robot_id)
+            _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
+            return QAResponse(code=0, message="参数接收成功")
+        if bool(robot.get("group_reply_only_when_mentioned")) and not bool(req.atMe):
+            logger.info("qa_callback_skipped robot_id=%s reason=group_only_when_mentioned", robot_id)
+            _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
+            return QAResponse(code=0, message="参数接收成功")
+
+    selected_rule: Optional[Dict[str, Any]] = None
+    rules = _load_enabled_rules(robot_pk, scene)
+    logger.info(
+        "qa_callback_rules_loaded robot_id=%s scene=%s rule_count=%s match_target=%s",
+        robot_id,
+        scene,
+        len(rules),
+        _short_text(match_target, 120),
+    )
+    for rule in rules:
+        pattern = str(rule.get("pattern") or "")
+        if not pattern:
+            continue
+        try:
+            if re.search(pattern, match_target):
+                selected_rule = rule
+                break
+        except re.error:
+            logger.warning(
+                "qa_callback_rule_invalid_regex robot_id=%s rule_id=%s pattern=%s",
+                robot_id,
+                rule.get("id"),
+                _short_text(pattern, 120),
+            )
+            continue
+
+    if not selected_rule:
+        logger.info("qa_callback_rule_not_matched robot_id=%s scene=%s", robot_id, scene)
+        default_reply = _load_default_reply(robot_pk, scene)
+        if default_reply:
+            logger.info("qa_callback_default_reply robot_id=%s scene=%s reply=%s", robot_id, scene, _short_text(default_reply, 160))
+            try:
+                await _send_worktool_text(robot_id, scene, req, default_reply)
+                _insert_message_log(robot_pk, "outbound", scene, default_reply, "success")
+            except Exception as e:
+                logger.exception("qa_callback_default_reply_send_failed robot_id=%s scene=%s err=%s", robot_id, scene, str(e))
+                _insert_message_log(robot_pk, "outbound", scene, str(e), "failed")
+            return QAResponse(code=0, message="参数接收成功")
+        _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
+        return QAResponse(code=0, message="参数接收成功")
+
+    logger.info(
+        "qa_callback_rule_matched robot_id=%s scene=%s rule_id=%s provider_id=%s pattern=%s",
+        robot_id,
+        scene,
+        selected_rule.get("id"),
+        selected_rule.get("provider_id"),
+        _short_text(str(selected_rule.get("pattern") or ""), 120),
+    )
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params={"robotId": robot_id}) as resp:
-                if resp.status != 200:
-                    raise HTTPException(status_code=resp.status, detail=f"worktool api status={resp.status}")
-                data = await resp.json()
-                if data.get("code") != 200:
-                    raise HTTPException(status_code=400, detail=data.get("message", "worktool api failed"))
-                return data
-    except HTTPException:
-        raise
+        reply_text = await _call_provider(selected_rule, inbound_text)
+        await _send_worktool_text(robot_id, scene, req, reply_text)
+        _insert_message_log(robot_pk, "outbound", scene, reply_text, "success")
+        return QAResponse(code=0, message="参数接收成功")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"worktool api error: {e}") from e
-
-
-async def fetch_worktool_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=20)
-    url = f"{get_worktool_api_base()}{path}"
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    raise HTTPException(status_code=resp.status, detail=f"worktool api status={resp.status}")
-                data = await resp.json()
-                if data.get("code") != 200:
-                    raise HTTPException(status_code=400, detail=data.get("message", "worktool api failed"))
-                return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"worktool api error: {e}") from e
-
-
-async def fetch_worktool_api_loose(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=20)
-    url = f"{get_worktool_api_base()}{path}"
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    raise HTTPException(status_code=resp.status, detail=f"worktool api status={resp.status}")
-                data = await resp.json()
-                code = data.get("code")
-                if code not in (0, 200):
-                    raise HTTPException(status_code=400, detail=data.get("message", "worktool api failed"))
-                return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"worktool api error: {e}") from e
-
-
-async def test_message_callback_url(callback_url: str) -> Dict[str, Any]:
-    test_body = {
-        "spoken": "您好,欢迎使用WorkTool~",
-        "rawSpoken": "@小明 您好,欢迎使用WorkTool~",
-        "receivedName": "WorkTool",
-        "groupName": "WorkTool",
-        "groupRemark": "WorkTool",
-        "roomType": 1,
-        "atMe": True,
-        "textType": 1,
-    }
-    timeout = aiohttp.ClientTimeout(total=15)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(callback_url, json=test_body) as resp:
-                body_text = await resp.text()
-                if resp.status != 200:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"测试失败：响应状态码必须为200，当前为{resp.status}",
-                    )
-
-                content_type = (resp.headers.get("Content-Type") or "").lower()
-                if "application/json" not in content_type:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"测试失败：响应头Content-Type必须包含application/json，当前为{content_type or '空'}",
-                    )
-
-                try:
-                    response_json = json.loads(body_text)
-                except json.JSONDecodeError:
-                    raise HTTPException(status_code=400, detail="测试失败：响应内容不是有效JSON格式")
-
-                data = response_json.get("data")
-                if data is not None and not isinstance(data, dict):
-                    raise HTTPException(status_code=400, detail='测试失败："data" 键错误，请删除或改为对象')
-
-                return {
-                    "ok": True,
-                    "message": "回调地址测试通过",
-                    "status_code": resp.status,
-                    "content_type": content_type,
-                    "response_json": response_json,
-                }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"测试失败：请求发生错误：{e}") from e
-
-
-async def bind_message_callback(robot_id: str, callback_url: str, reply_all: int = 1) -> Dict[str, Any]:
-    url = f"{get_worktool_api_base()}/robot/robotInfo/update"
-    payload = {
-        "openCallback": 1,
-        "replyAll": 1 if reply_all else 0,
-        "callbackUrl": callback_url,
-    }
-    timeout = aiohttp.ClientTimeout(total=20)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, params={"robotId": robot_id}, json=payload) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"绑定失败：平台接口HTTP状态码为{resp.status}",
-                    )
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    raise HTTPException(status_code=400, detail="绑定失败：平台返回不是JSON")
-                code = data.get("code")
-                if code not in (0, 200):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"绑定失败：{data.get('message', '未知错误')} (code={code})",
-                    )
-                return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"绑定失败：请求异常：{e}") from e
-
-
-async def bind_robot_callback_type(robot_id: str, callback_url: str, callback_type: int) -> Dict[str, Any]:
-    url = f"{get_worktool_api_base()}/robot/robotInfo/callBack/bind"
-    payload = {"type": callback_type, "callBackUrl": callback_url}
-    timeout = aiohttp.ClientTimeout(total=20)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, params={"robotId": robot_id}, json=payload) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"绑定失败：type={callback_type} 平台接口HTTP状态码为{resp.status}",
-                    )
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    raise HTTPException(status_code=400, detail=f"绑定失败：type={callback_type} 平台返回不是JSON")
-                code = data.get("code")
-                if code not in (0, 200):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"绑定失败：type={callback_type} {data.get('message', '未知错误')} (code={code})",
-                    )
-                return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"绑定失败：type={callback_type} 请求异常：{e}") from e
-
-
-async def test_callback_url_status_2xx(callback_url: str) -> Dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=12)
-    payload = {"event": "worktool_callback_test", "timestamp": now_iso()}
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(callback_url, json=payload) as resp:
-                if 200 <= resp.status < 300:
-                    return {"ok": True, "status_code": resp.status}
-                text = await resp.text()
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"测试失败：响应状态码不是2xx，当前为{resp.status}，响应内容：{text[:300]}",
-                )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"测试失败：请求异常：{e}") from e
-
-
-async def delete_robot_callback_type(robot_id: str, callback_type: int, robot_key: str = "") -> Dict[str, Any]:
-    url = f"{get_worktool_api_base()}/robot/robotInfo/callBack/deleteByType"
-    payload = {"type": callback_type}
-    timeout = aiohttp.ClientTimeout(total=20)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                url,
-                params={"robotId": robot_id, "robotKey": robot_key},
-                json=payload,
-            ) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"删除失败：type={callback_type} 平台接口HTTP状态码为{resp.status}",
-                    )
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    raise HTTPException(status_code=400, detail=f"删除失败：type={callback_type} 平台返回不是JSON")
-                code = data.get("code")
-                if code not in (0, 200):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"删除失败：type={callback_type} {data.get('message', '未知错误')} (code={code})",
-                    )
-                return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"删除失败：type={callback_type} 请求异常：{e}") from e
-
-
-@app.get("/api/v1/robot-info/detail")
-async def get_robot_info_detail(robot_id: str) -> Dict[str, Any]:
-    return await fetch_worktool_robot_info("/robot/robotInfo/get-detail", robot_id)
-
-
-@app.get("/api/v1/robot-info/callbacks")
-async def get_robot_info_callbacks(robot_id: str) -> Dict[str, Any]:
-    return await fetch_worktool_robot_info("/robot/robotInfo/callBack/get", robot_id)
-
-
-@app.get("/api/v1/robot-info/online")
-async def get_robot_info_online(robot_id: str) -> Dict[str, Any]:
-    return await fetch_worktool_robot_info("/robot/robotInfo/online", robot_id)
-
-
-@app.get("/api/v1/robot-info/online-infos")
-async def get_robot_info_online_infos(robot_id: str) -> Dict[str, Any]:
-    return await fetch_worktool_robot_info("/robot/robotInfo/onlineInfos", robot_id)
-
-
-@app.post("/api/v1/robot-info/message-callback/test")
-async def test_robot_message_callback(body: MessageCallbackPayload) -> Dict[str, Any]:
-    callback_url = (body.callback_url or "").strip()
-    if not callback_url:
-        raise HTTPException(status_code=400, detail="测试失败：回调地址不能为空")
-    test_result = await test_message_callback_url(callback_url)
-    return {"code": 200, "message": "测试通过", "data": test_result}
-
-
-@app.post("/api/v1/robot-info/callbacks/test")
-async def test_robot_callback(body: CallbackTestPayload) -> Dict[str, Any]:
-    callback_url = (body.callback_url or "").strip()
-    if not callback_url:
-        raise HTTPException(status_code=400, detail="测试失败：回调地址不能为空")
-    result = await test_callback_url_status_2xx(callback_url)
-    return {"code": 200, "message": "测试通过", "data": result}
-
-
-@app.post("/api/v1/robot-info/message-callback/bind")
-async def bind_robot_message_callback(body: MessageCallbackPayload) -> Dict[str, Any]:
-    callback_url = (body.callback_url or "").strip()
-    robot_id = (body.robot_id or "").strip()
-    if not robot_id:
-        raise HTTPException(status_code=400, detail="绑定失败：robot_id不能为空")
-    if not callback_url:
-        raise HTTPException(status_code=400, detail="绑定失败：回调地址不能为空")
-
-    test_result = await test_message_callback_url(callback_url)
-    bind_result = await bind_message_callback(robot_id, callback_url, body.reply_all)
-    write_audit("bind", "message_callback", robot_id, callback_url)
-    return {
-        "code": 200,
-        "message": "绑定成功",
-        "data": {"test_result": test_result, "bind_result": bind_result},
-    }
-
-
-@app.post("/api/v1/robot-info/callbacks/bind")
-async def bind_robot_callback(body: RobotCallbackBindPayload) -> Dict[str, Any]:
-    robot_id = (body.robot_id or "").strip()
-    callback_url = (body.callback_url or "").strip()
-    callback_type = body.type
-    if not robot_id:
-        raise HTTPException(status_code=400, detail="绑定失败：robot_id不能为空")
-    if not callback_url:
-        raise HTTPException(status_code=400, detail="绑定失败：回调地址不能为空")
-    if callback_type not in {0, 1, 5, 6}:
-        raise HTTPException(status_code=400, detail="绑定失败：type仅支持0/1/5/6")
-
-    bind_result = await bind_robot_callback_type(robot_id, callback_url, callback_type)
-    write_audit("bind", "callback_type", robot_id, f"type={callback_type}, url={callback_url}")
-    return {"code": 200, "message": "绑定成功", "data": bind_result}
-
-
-@app.post("/api/v1/robot-info/callbacks/delete-by-type")
-async def delete_robot_callback(body: RobotCallbackDeletePayload) -> Dict[str, Any]:
-    robot_id = (body.robot_id or "").strip()
-    callback_type = body.type
-    robot_key = body.robot_key or ""
-    if not robot_id:
-        raise HTTPException(status_code=400, detail="删除失败：robot_id不能为空")
-    if callback_type not in {0, 1, 5, 6, 11}:
-        raise HTTPException(status_code=400, detail="删除失败：type仅支持0/1/5/6/11")
-
-    delete_result = await delete_robot_callback_type(robot_id, callback_type, robot_key)
-    write_audit("delete", "callback_type", robot_id, f"type={callback_type}")
-    return {"code": 200, "message": "删除成功", "data": delete_result}
+        logger.exception(
+            "qa_callback_provider_failed robot_id=%s scene=%s rule_id=%s provider_id=%s err=%s",
+            robot_id,
+            scene,
+            selected_rule.get("id"),
+            selected_rule.get("provider_id"),
+            str(e),
+        )
+        _insert_message_log(robot_pk, "outbound", scene, str(e), "failed")
+        default_reply = _load_default_reply(robot_pk, scene)
+        if default_reply:
+            logger.info("qa_callback_fallback_default_reply robot_id=%s scene=%s", robot_id, scene)
+            try:
+                await _send_worktool_text(robot_id, scene, req, default_reply)
+                _insert_message_log(robot_pk, "outbound", scene, default_reply, "success")
+            except Exception as e2:
+                logger.exception("qa_callback_fallback_send_failed robot_id=%s scene=%s err=%s", robot_id, scene, str(e2))
+                _insert_message_log(robot_pk, "outbound", scene, str(e2), "failed")
+            return QAResponse(code=0, message="参数接收成功")
+        return QAResponse(code=0, message="参数接收成功")
 
 
 @app.get("/api/v1/worktool/qa-logs")
 async def get_worktool_qa_logs(
     robot_id: str,
-    page: int = Query(default=1, ge=1),
-    size: int = Query(default=20, ge=1, le=200),
-    sort: str = Query(default="start_time,desc"),
-    name: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
+    page: int = 1,
+    size: int = 20,
+    sort: str = "start_time,desc",
+    user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"robotId": robot_id, "page": page, "size": size, "sort": sort}
-    if name:
-        params["name"] = name
-    if start_time:
-        params["startTime"] = start_time
-    if end_time:
-        params["endTime"] = end_time
-    return await fetch_worktool_api("/robot/qaLog/list", params)
+    _require_robot_access(int(user["id"]), robot_id)
+    return await fetch_worktool_api("/robot/qaLog/list", {"robotId": robot_id, "page": page, "size": size, "sort": sort})
 
 
-def _mask_ip(ip: Optional[str]) -> str:
-    if not ip:
-        return "-"
-    chunks = ip.split(".")
-    if len(chunks) == 4:
-        return f"{chunks[0]}.{chunks[1]}.*.*"
-    return ip
+@app.get("/api/v1/robot-info/detail")
+async def get_robot_info_detail(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    return await fetch_worktool_api("/robot/robotInfo/get-detail", {"robotId": robot_id})
 
 
-def _safe_limit(limit: int, default: int = 20, max_limit: int = 100) -> int:
-    if limit <= 0:
-        return default
-    return min(limit, max_limit)
+@app.get("/api/v1/robot-info/callbacks")
+async def get_robot_info_callbacks(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    return await fetch_worktool_api("/robot/robotInfo/callBack/get", {"robotId": robot_id})
 
 
-def _parse_loose_datetime(value: Optional[str]) -> float:
-    if not value:
-        return 0
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(value, fmt).timestamp()
-        except ValueError:
-            continue
-    try:
-        return datetime.fromisoformat(value).timestamp()
-    except ValueError:
-        return 0
+@app.get("/api/v1/robot-info/online")
+async def get_robot_info_online(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    return await fetch_worktool_api("/robot/robotInfo/online", {"robotId": robot_id})
 
 
-async def _fetch_qa_logs_page(
-    robot_id: str,
-    page: int,
-    size: int,
-    keyword: str = "",
-    start_time: str = "",
-    end_time: str = "",
-    message_id: str = "",
-) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {"robotId": robot_id, "page": page, "size": size, "sort": "start_time,desc"}
-    if keyword:
-        params["name"] = keyword
-    if start_time:
-        params["startTime"] = start_time
-    if end_time:
-        params["endTime"] = end_time
-    if message_id:
-        params["messageId"] = message_id
-        params["message_id"] = message_id
-    data = await fetch_worktool_api("/robot/qaLog/list", params)
-    return data.get("data", {}).get("list", []) or []
+@app.get("/api/v1/robot-info/online-infos")
+async def get_robot_info_online_infos(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    return await fetch_worktool_api("/robot/robotInfo/onlineInfos", {"robotId": robot_id})
 
 
-def _mysql_resolve_robot_id_by_message(message_id: str) -> Optional[str]:
-    if not message_id:
-        return None
-    sqls = [
-        (
-            """
-            SELECT robot_id
-            FROM raw_message_record
-            WHERE message_id = %s AND robot_id IS NOT NULL AND robot_id <> ''
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (message_id,),
-        ),
-        (
-            """
-            SELECT robot_id
-            FROM raw_msg_confirm
-            WHERE message_id = %s AND robot_id IS NOT NULL AND robot_id <> ''
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (message_id,),
-        ),
-        (
-            """
-            SELECT robot_id
-            FROM qa_log
-            WHERE message_id = %s AND robot_id IS NOT NULL AND robot_id <> ''
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (message_id,),
-        ),
-    ]
-    for sql, params in sqls:
-        rows = _mysql_query(sql, params)
-        if rows and rows[0].get("robot_id"):
-            return str(rows[0]["robot_id"])
-    return None
+@app.post("/api/v1/robot-info/message-callback/test")
+async def test_robot_message_callback(body: MessageCallbackPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), (body.robot_id or "").strip())
+    return {"ok": True, "robot_id": body.robot_id, "callback_url": body.callback_url}
 
 
-def _mysql_build_where(
-    robot_id: str,
-    message_id: str,
-    keyword: str,
-    start_time: str,
-    end_time: str,
-    robot_field: Optional[str] = None,
-    message_field: Optional[str] = None,
-    time_field: Optional[str] = None,
-    keyword_fields: Optional[List[str]] = None,
-) -> Tuple[str, List[Any]]:
-    where: List[str] = []
-    params: List[Any] = []
-    if robot_id and robot_field:
-        where.append(f"{robot_field} = %s")
-        params.append(robot_id)
-    if message_id and message_field:
-        where.append(f"{message_field} = %s")
-        params.append(message_id)
-    if start_time and time_field:
-        where.append(f"{time_field} >= %s")
-        params.append(start_time)
-    if end_time and time_field:
-        where.append(f"{time_field} <= %s")
-        params.append(end_time)
-    if keyword and keyword_fields:
-        chunks = []
-        for f in keyword_fields:
-            chunks.append(f"{f} LIKE %s")
-            params.append(f"%{keyword}%")
-        if chunks:
-            where.append("(" + " OR ".join(chunks) + ")")
-    return (" WHERE " + " AND ".join(where)) if where else "", params
+@app.post("/api/v1/robot-info/callbacks/test")
+async def test_robot_callback(body: CallbackTestPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _ = user
+    return {"ok": True, "callback_url": body.callback_url}
 
 
-def _mysql_table_query(
-    table: str,
-    robot_id: str,
-    message_id: str,
-    keyword: str,
-    start_time: str,
-    end_time: str,
-    limit: int,
-    robot_field: Optional[str] = None,
-    message_field: Optional[str] = None,
-    time_field: Optional[str] = None,
-    keyword_fields: Optional[List[str]] = None,
-    order_by: str = "id DESC",
-) -> List[Dict[str, Any]]:
-    where_sql, params = _mysql_build_where(
-        robot_id=robot_id,
-        message_id=message_id,
-        keyword=keyword,
-        start_time=start_time,
-        end_time=end_time,
-        robot_field=robot_field,
-        message_field=message_field,
-        time_field=time_field,
-        keyword_fields=keyword_fields,
-    )
-    sql = f"SELECT * FROM {table}{where_sql} ORDER BY {order_by} LIMIT %s"
-    params.append(limit)
-    return _mysql_query(sql, tuple(params))
+@app.post("/api/v1/robot-info/message-callback/bind")
+async def bind_robot_message_callback(body: MessageCallbackPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    rid = (body.robot_id or "").strip()
+    _require_robot_access(int(user["id"]), rid)
+    res = await bind_message_callback(rid, (body.callback_url or "").strip(), int(body.reply_all))
+    return {"ok": True, "result": res}
 
 
-def _sanitize_mysql_raw_message_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "时间": x.get("create_time"),
-            "消息ID": x.get("message_id") or "",
-            "消息类型": x.get("type_list"),
-            "来源IP": _mask_ip(x.get("ip")),
-            "是否API发送": x.get("api_send"),
-            "发送内容": (x.get("body") or "")[:300],
-        }
-        for x in rows
-    ]
+@app.post("/api/v1/robot-info/callbacks/bind")
+async def bind_robot_callback(body: RobotCallbackBindPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    rid = (body.robot_id or "").strip()
+    _require_robot_access(int(user["id"]), rid)
+    # 与 message callback 统一复用
+    res = await bind_message_callback(rid, (body.callback_url or "").strip(), 1)
+    return {"ok": True, "type": body.type, "result": res}
 
 
-def _sanitize_mysql_raw_confirm_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def parse_json_list(value: Any) -> List[Any]:
-        if isinstance(value, list):
-            return value
-        if not value:
-            return []
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                return parsed if isinstance(parsed, list) else []
-            except json.JSONDecodeError:
-                return []
-        return []
-
-    def is_success(row: Dict[str, Any]) -> bool:
-        error_code = row.get("error_code")
-        if error_code is not None:
-            try:
-                return int(error_code) == 0
-            except Exception:
-                pass
-
-        fail_list = parse_json_list(row.get("fail_list"))
-        if len(fail_list) > 0:
-            return False
-
-        success_list = parse_json_list(row.get("success_list"))
-        if len(success_list) > 0:
-            return True
-
-        if (row.get("error_reason") or "").strip():
-            return False
-
-        # 与用户环境保持一致：raw_success=0 代表执行成功
-        if row.get("raw_success") is not None:
-            try:
-                return int(row.get("raw_success")) == 0
-            except Exception:
-                return False
-        return False
-
-    return [
-        {
-            "时间": x.get("create_time"),
-            "消息ID": x.get("message_id") or "",
-            "执行结果": "成功" if is_success(x) else "失败",
-            "耗时(秒)": x.get("time_cost"),
-            "失败原因": (x.get("error_reason") or "")[:200],
-        }
-        for x in rows
-    ]
-
-
-async def _resolve_robot_id_by_message(message_id: str) -> Optional[str]:
-    conn = get_conn()
-    robots = conn.execute("SELECT robot_id FROM robots ORDER BY id ASC").fetchall()
-    conn.close()
-    page_size = 50
-    max_scan_pages = 2
-
-    async def has_msg_in_raw_message(robot_id: str, use_filter: bool) -> bool:
-        for page in range(1, max_scan_pages + 1):
-            params: Dict[str, Any] = {"robotId": robot_id, "page": page, "size": page_size}
-            if use_filter:
-                params["messageId"] = message_id
-            data = await fetch_worktool_api_loose("/wework/listRawMessage", params)
-            payload = data.get("data", {})
-            rows = payload.get("list") or payload.get("records") or payload or []
-            if not isinstance(rows, list):
-                rows = []
-            if any((x.get("messageId") or "") == message_id for x in rows):
-                return True
-            total_page = int(payload.get("totalPage") or 0) if isinstance(payload, dict) else 0
-            if use_filter and len(rows) == 0:
-                return False
-            if total_page > 0 and page >= total_page:
-                return False
-            if not rows:
-                return False
-        return False
-
-    async def has_msg_in_raw_confirm(robot_id: str, use_filter: bool) -> bool:
-        for page in range(1, max_scan_pages + 1):
-            params: Dict[str, Any] = {"robotId": robot_id, "page": page, "size": page_size}
-            if use_filter:
-                params["messageId"] = message_id
-            data = await fetch_worktool_api_loose("/robot/rawMsg/list", params)
-            payload = data.get("data", {})
-            if isinstance(payload, dict):
-                rows = payload.get("list") or payload.get("records") or []
-                total_page = int(payload.get("totalPage") or 0)
-            elif isinstance(payload, list):
-                rows = payload
-                total_page = 0
-            else:
-                rows = []
-                total_page = 0
-            if any((x.get("messageId") or "") == message_id for x in rows):
-                return True
-            if use_filter and len(rows) == 0:
-                return False
-            if total_page > 0 and page >= total_page:
-                return False
-            if not rows:
-                return False
-        return False
-
-    for row in robots:
-        robot_id = row["robot_id"]
-        try:
-            if await has_msg_in_raw_message(robot_id, use_filter=True):
-                return robot_id
-            if await has_msg_in_raw_confirm(robot_id, use_filter=True):
-                return robot_id
-            rows = await _fetch_qa_logs_page(robot_id=robot_id, page=1, size=50, message_id=message_id)
-            if any((x.get("messageId") or "") == message_id for x in rows):
-                return robot_id
-        except HTTPException:
-            continue
-    return None
-
-
-def _sanitize_qa_rows(rows: List[Dict[str, Any]], message_id: str, limit: int) -> List[Dict[str, Any]]:
-    filtered = rows
-    if message_id:
-        filtered = [x for x in rows if (x.get("messageId") or "") == message_id]
-    output = []
-    for x in filtered[:limit]:
-        output.append(
-            {
-                "时间": x.get("startTime"),
-                "提问者": x.get("receivedName"),
-                "会话": x.get("groupName"),
-                "消息类型": x.get("textType"),
-                "是否@机器人": x.get("atMe"),
-                "问题": x.get("question") or x.get("rawSpoken"),
-                "回答": x.get("answer") or "",
-                "回调耗时(秒)": x.get("timeCost"),
-                "消息ID": x.get("messageId") or "",
-            }
-        )
-    return output
-
-
-async def _fetch_raw_message_records(robot_id: str, message_id: str, limit: int) -> List[Dict[str, Any]]:
-    # 官方历史接口（对应 raw_message_record）
-    # 文档: /wework/listRawMessage
-    params = {"robotId": robot_id, "page": 1, "size": min(max(limit, 20), 200)}
-    data = await fetch_worktool_api_loose("/wework/listRawMessage", params)
-    raw_list = data.get("data", {}).get("list") or data.get("data", {}).get("records") or data.get("data") or []
-    if not isinstance(raw_list, list):
-        return []
-    if message_id:
-        raw_list = [x for x in raw_list if (x.get("messageId") or "") == message_id]
-    return [
-        {
-            "时间": x.get("createTime") or x.get("startTime") or "-",
-            "消息ID": x.get("messageId") or "",
-            "接收对象": x.get("titleList") or x.get("title") or "",
-            "发送内容": x.get("receivedContent") or x.get("rawMsg") or "",
-            "消息类型": x.get("type"),
-            "状态": x.get("status"),
-        }
-        for x in raw_list[:limit]
-    ]
-
-
-async def _fetch_raw_msg_confirms(robot_id: str, message_id: str, limit: int) -> List[Dict[str, Any]]:
-    # 官方历史接口（对应 raw_msg_confirm）
-    # 文档: /robot/rawMsg/list
-    params = {"robotId": robot_id, "size": min(max(limit, 20), 200)}
-    data = await fetch_worktool_api_loose("/robot/rawMsg/list", params)
-    raw_list = data.get("data") or []
-    if not isinstance(raw_list, list):
-        return []
-    if message_id:
-        raw_list = [x for x in raw_list if (x.get("messageId") or "") == message_id]
-    return [
-        {
-            "时间": x.get("createTime") or "-",
-            "消息ID": x.get("messageId") or "",
-            "执行结果": "成功" if x.get("success") else "失败",
-            "执行耗时(秒)": x.get("costTimes"),
-            "失败原因": x.get("errorReason") or "",
-        }
-        for x in raw_list[:limit]
-    ]
+@app.post("/api/v1/robot-info/callbacks/delete-by-type")
+async def delete_robot_callback(body: RobotCallbackDeletePayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), (body.robot_id or "").strip())
+    return {"ok": True, "robot_id": body.robot_id, "type": body.type}
 
 
 @app.post("/api/v1/troubleshoot/search")
-async def troubleshoot_search(body: TroubleshootSearchPayload) -> Dict[str, Any]:
-    if not ENABLE_TROUBLESHOOT:
-        raise HTTPException(status_code=404, detail="机器人排查功能在开源版中默认关闭")
+async def troubleshoot_search(body: TroubleshootSearchPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    return await run_troubleshoot_search(
+        body,
+        enable_troubleshoot=ENABLE_TROUBLESHOOT,
+        get_worktool_api_base=get_worktool_api_base,
+        fetch_worktool_api=fetch_worktool_api,
+        db_conn_factory=db_conn,
+    )
 
-    robot_id = (body.robot_id or "").strip()
-    message_id = (body.message_id or "").strip()
-    keyword = (body.keyword or "").strip()
-    start_time = (body.start_time or "").strip()
-    end_time = (body.end_time or "").strip()
-    limit = _safe_limit(body.limit)
 
-    if not robot_id and not message_id:
-        raise HTTPException(status_code=400, detail="robot_id 和 message_id 至少填写一个")
-
-    resolved_from_message = False
-    if not robot_id and message_id:
-        robot_id = _mysql_resolve_robot_id_by_message(message_id) or ""
-        if not robot_id:
-            robot_id = await _resolve_robot_id_by_message(message_id) or ""
-        resolved_from_message = bool(robot_id)
-
-    if not robot_id:
-        conn = get_conn()
-        robot_count = conn.execute("SELECT COUNT(1) AS c FROM robots").fetchone()["c"]
+@app.get("/api/v1/admin/users")
+async def admin_list_users(
+    phone: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(user)
+    kw = (phone or "").strip()
+    like = f"%{kw}%"
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            if kw:
+                cur.execute("SELECT COUNT(1) AS c FROM users WHERE phone LIKE %s", (like,))
+            else:
+                cur.execute("SELECT COUNT(1) AS c FROM users")
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            offset = (page - 1) * page_size
+            if kw:
+                cur.execute(
+                    """
+                    SELECT
+                      u.id,u.phone,u.company_name,u.created_at,u.last_login_at,
+                      GROUP_CONCAT(DISTINCT r.robot_id ORDER BY r.robot_id SEPARATOR ',') AS robot_ids
+                    FROM users u
+                    LEFT JOIN user_robots ur ON ur.user_id=u.id
+                    LEFT JOIN robots r ON r.id=ur.robot_pk
+                    WHERE u.phone LIKE %s
+                    GROUP BY u.id,u.phone,u.company_name,u.created_at,u.last_login_at
+                    ORDER BY u.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (like, page_size, offset),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                      u.id,u.phone,u.company_name,u.created_at,u.last_login_at,
+                      GROUP_CONCAT(DISTINCT r.robot_id ORDER BY r.robot_id SEPARATOR ',') AS robot_ids
+                    FROM users u
+                    LEFT JOIN user_robots ur ON ur.user_id=u.id
+                    LEFT JOIN robots r ON r.id=ur.robot_pk
+                    GROUP BY u.id,u.phone,u.company_name,u.created_at,u.last_login_at
+                    ORDER BY u.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (page_size, offset),
+                )
+            rows = cur.fetchall() or []
+    finally:
         conn.close()
-        return {
-            "input": {
-                "robot_id": body.robot_id,
-                "message_id": message_id,
-                "keyword": keyword,
-                "start_time": start_time,
-                "end_time": end_time,
-                "limit": limit,
-            },
-            "resolved": {
-                "robot_id": "",
-                "message_resolved_robot": False,
-            },
-            "sections": {
-                "机器人状态": {},
-                "回调配置": [],
-                "上线记录(最多20条)": [],
-                "raw_message_record 指令发送记录表": [],
-                "raw_msg_confirm 指令客户端执行结果表": [],
-                "问答回调记录": [],
-                "本地消息处理记录": [],
-            },
-            "diagnostics": [
-                f"未通过 message_id 反查到机器人（已扫描当前系统内 {robot_count} 个机器人）。",
-                "请补充 robot_id 后重试，可直接定位该消息所在机器人。",
-            ],
-        }
 
-    detail_data = (await fetch_worktool_robot_info("/robot/robotInfo/get-detail", robot_id)).get("data", {}) or {}
-    callbacks_data = (await fetch_worktool_robot_info("/robot/robotInfo/callBack/get", robot_id)).get("data", []) or []
-    online_data = (await fetch_worktool_robot_info("/robot/robotInfo/online", robot_id)).get("data", False)
-    online_infos_data = (await fetch_worktool_robot_info("/robot/robotInfo/onlineInfos", robot_id)).get("data", []) or []
-    online_infos_data = sorted(
-        online_infos_data,
-        key=lambda x: _parse_loose_datetime(x.get("onlineTime")),
-        reverse=True,
-    )[:20]
-    qa_rows = await _fetch_qa_logs_page(
-        robot_id=robot_id,
-        page=1,
-        size=max(limit, 50),
-        keyword=keyword,
-        start_time=start_time,
-        end_time=end_time,
-        message_id=message_id,
-    )
-    mysql_raw_message_rows = _mysql_table_query(
-        table="raw_message_record",
-        robot_id=robot_id,
-        message_id=message_id,
-        keyword=keyword,
-        start_time=start_time,
-        end_time=end_time,
-        limit=limit,
-        robot_field="robot_id",
-        message_field="message_id",
-        time_field="create_time",
-        keyword_fields=["body", "ip", "type_list"],
-    )
-    mysql_raw_confirm_rows = _mysql_table_query(
-        table="raw_msg_confirm",
-        robot_id=robot_id,
-        message_id=message_id,
-        keyword=keyword,
-        start_time=start_time,
-        end_time=end_time,
-        limit=limit,
-        robot_field="robot_id",
-        message_field="message_id",
-        time_field="create_time",
-        keyword_fields=["raw_msg", "error_reason", "success_list", "fail_list"],
-    )
-    raw_message_rows = (
-        _sanitize_mysql_raw_message_rows(mysql_raw_message_rows)
-        if mysql_raw_message_rows
-        else await _fetch_raw_message_records(robot_id, message_id, limit)
-    )
-    raw_confirm_rows = (
-        _sanitize_mysql_raw_confirm_rows(mysql_raw_confirm_rows)
-        if mysql_raw_confirm_rows
-        else await _fetch_raw_msg_confirms(robot_id, message_id, limit)
-    )
-
-    conn = get_conn()
-    logs = conn.execute(
-        """
-        SELECT direction, scene, group_name, sender_name, receiver_name, normalized_content, status, created_at
-        FROM message_logs
-        WHERE robot_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (robot_id, limit),
-    ).fetchall()
-    conn.close()
-
-    diagnostics: List[str] = []
-    if message_id and not any((x.get("messageId") or "") == message_id for x in qa_rows):
-        diagnostics.append("该 message_id 在近1页问答记录中未命中，请检查时间范围后重试。")
-    if not online_data:
-        diagnostics.append("机器人当前离线。")
-    if detail_data.get("robotType") == 4:
-        diagnostics.append("机器人状态无效（robotType=4）。")
-    if message_id and len(raw_message_rows) > 0 and len(raw_confirm_rows) == 0:
-        diagnostics.append("找到指令发送记录，但未找到客户端执行结果记录。")
-
-    return {
-        "input": {
-            "robot_id": body.robot_id,
-            "message_id": message_id,
-            "keyword": keyword,
-            "start_time": start_time,
-            "end_time": end_time,
-            "limit": limit,
-        },
-        "resolved": {
-            "robot_id": robot_id,
-            "message_resolved_robot": resolved_from_message,
-        },
-        "sections": {
-            "机器人状态": {
-                "机器人ID": detail_data.get("robotId") or robot_id,
-                "机器人名称": detail_data.get("name") or "-",
-                "识别账号昵称": detail_data.get("showName") or "-",
-                "企业名称": detail_data.get("corporation") or "-",
-                "首次登录": detail_data.get("firstLogin") or "-",
-                "授权到期": detail_data.get("authExpir") or detail_data.get("authExpire") or "-",
-                "当前在线": bool(online_data),
-                "是否有效": bool(detail_data.get("robotType") != 4),
-            },
-            "回调配置": [
-                {"回调类型": x.get("typeName"), "回调地址": x.get("callBackUrl"), "类型编号": x.get("type")}
-                for x in callbacks_data[:20]
-            ],
-            "上线记录(最多20条)": [
-                {
-                    "上线时间": x.get("onlineTime"),
-                    "下线时间": x.get("offline") or "",
-                    "在线时长(分钟)": x.get("onlineTimes"),
-                    "登录IP": _mask_ip(x.get("ip")),
-                }
-                for x in online_infos_data
-            ],
-            "raw_message_record 指令发送记录表": raw_message_rows,
-            "raw_msg_confirm 指令客户端执行结果表": raw_confirm_rows,
-            "问答回调记录": _sanitize_qa_rows(qa_rows, message_id, limit),
-            "本地消息处理记录": [
-                {
-                    "时间": r["created_at"],
-                    "方向": "接收" if r["direction"] == "inbound" else "发送",
-                    "场景": "群聊" if r["scene"] == "group" else "私聊",
-                    "会话": r["group_name"] or r["receiver_name"] or "-",
-                    "消息": (r["normalized_content"] or "")[:120],
-                    "状态": r["status"],
-                }
-                for r in logs
-            ],
-        },
-        "diagnostics": diagnostics,
-    }
+    items = []
+    for row in rows:
+        ids = (row.get("robot_ids") or "").strip()
+        items.append(
+            {
+                "id": int(row["id"]),
+                "phone": row["phone"],
+                "company_name": row.get("company_name"),
+                "created_at": str(row["created_at"]),
+                "last_login_at": str(row["last_login_at"]) if row.get("last_login_at") else None,
+                "robot_ids": [x for x in ids.split(",") if x] if ids else [],
+            }
+        )
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 if __name__ == "__main__":
     import uvicorn
 
     init_db()
-    import_config_json_if_needed()
-    host = get_setting("host", "0.0.0.0")
-    port = int(get_setting("port", "8000"))
-    uvicorn.run("main:app", host=host, port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

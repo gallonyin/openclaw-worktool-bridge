@@ -8,7 +8,7 @@ WorkTool 企业微信机器人桥接服务。
 - React + FastAPI 前后端分离
 - 机器人配置 / 规则管理 / 消息监控
 - WorkTool 机器人信息与回调管理
-- Docker Compose 一键启动（前端、后端、备份）
+- Docker Compose 一键启动（前端、后端、MySQL）
 
 ## Quick Start
 
@@ -32,11 +32,11 @@ docker compose up -d --build
 
 - `worktool-backend`: FastAPI backend
 - `worktool-frontend`: Nginx + frontend static files
-- `worktool-db-backup`: daily SQLite backup (7-day retention)
+- `worktool-mysql`: MySQL 8.4
 
 ## Notes
 
-- 默认使用 SQLite（持久化在 Docker Volume）
+- 默认使用 MySQL（持久化在 Docker Volume）
 - `.env` 文件仅本地使用，不应提交到仓库
 
 ## License

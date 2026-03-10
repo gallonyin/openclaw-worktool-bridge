@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Button, Card, Col, Input, Modal, Row, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
-import { SELECTED_ROBOT_STORAGE_KEY } from '../constants';
-import { loadLocalRobots, type LocalRobotItem } from '../localRobotStore';
+import type { Robot } from '../types';
+import { getLastSelectedRobotId, setLastSelectedRobotId } from '../robotSelection';
 
 interface CallbackItem {
   type: number;
@@ -51,14 +51,9 @@ function isNotExpired(val?: string) {
 }
 
 export default function RobotInfoPage() {
-  const [robots, setRobots] = useState<LocalRobotItem[]>(() => loadLocalRobots());
-  const [selectedRobotId, setSelectedRobotId] = useState<string | undefined>(() => {
-    try {
-      return localStorage.getItem(SELECTED_ROBOT_STORAGE_KEY) || undefined;
-    } catch {
-      return undefined;
-    }
-  });
+  const [robots, setRobots] = useState<Robot[]>([]);
+  const [robotsLoaded, setRobotsLoaded] = useState(false);
+  const [selectedRobotId, setSelectedRobotId] = useState<string | undefined>(() => getLastSelectedRobotId());
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<any>(null);
   const [callbacks, setCallbacks] = useState<CallbackItem[]>([]);
@@ -91,18 +86,15 @@ export default function RobotInfoPage() {
     setCallbackInput(tp === null ? '' : callbackMap.get(tp) || '');
   };
 
+  const selectRobot = (robotId?: string) => {
+    setSelectedRobotId(robotId);
+    setLastSelectedRobotId(robotId);
+  };
+
   const loadBaseRobots = async () => {
-    const items = loadLocalRobots();
+    const items = await api.listRobots();
     setRobots(items);
-    if (items.length === 0) {
-      setSelectedRobotId(undefined);
-      return;
-    }
-    const current = selectedRobotId;
-    const exists = current && items.some((x) => x.robot_id === current);
-    if (!exists) {
-      setSelectedRobotId(items[0].robot_id);
-    }
+    setRobotsLoaded(true);
   };
 
   const loadInfo = async (robotId?: string) => {
@@ -149,17 +141,20 @@ export default function RobotInfoPage() {
   }, []);
 
   useEffect(() => {
-    void loadInfo(selectedRobotId);
-  }, [selectedRobotId]);
+    if (!robotsLoaded) return;
+    if (robots.length === 0) {
+      selectRobot(undefined);
+      return;
+    }
+    const current = selectedRobotId;
+    const exists = current && robots.some((x: Robot) => x.robot_id === current);
+    if (!exists) {
+      selectRobot(robots[0].robot_id);
+    }
+  }, [robotsLoaded, robots, selectedRobotId]);
 
   useEffect(() => {
-    try {
-      if (selectedRobotId) {
-        localStorage.setItem(SELECTED_ROBOT_STORAGE_KEY, selectedRobotId);
-      }
-    } catch {
-      // ignore storage errors
-    }
+    void loadInfo(selectedRobotId);
   }, [selectedRobotId]);
 
   const onlineText = online === true ? '在线' : '不在线';
@@ -305,7 +300,7 @@ export default function RobotInfoPage() {
           <Select
             style={{ width: 340 }}
             value={selectedRobotId}
-            onChange={setSelectedRobotId}
+            onChange={selectRobot}
             options={robotOptions}
             placeholder="更换机器人"
             showSearch

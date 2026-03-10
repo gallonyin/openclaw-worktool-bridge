@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Button, Card, Input, Select, Space, Table, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
-import { SELECTED_ROBOT_STORAGE_KEY } from '../constants';
-import { loadLocalRobots, type LocalRobotItem } from '../localRobotStore';
+import type { Robot } from '../types';
+import { getLastSelectedRobotId, setLastSelectedRobotId } from '../robotSelection';
 
 interface QaLogItem {
   robotId: string;
@@ -30,14 +30,9 @@ const roomTypeMap: Record<number, string> = {
 };
 
 export default function MessageLogPage() {
-  const [robots, setRobots] = useState<LocalRobotItem[]>(() => loadLocalRobots());
-  const [robotId, setRobotId] = useState<string | undefined>(() => {
-    try {
-      return localStorage.getItem(SELECTED_ROBOT_STORAGE_KEY) || undefined;
-    } catch {
-      return undefined;
-    }
-  });
+  const [robots, setRobots] = useState<Robot[]>([]);
+  const [robotsLoaded, setRobotsLoaded] = useState(false);
+  const [robotId, setRobotId] = useState<string | undefined>(() => getLastSelectedRobotId());
   const [nameKeyword, setNameKeyword] = useState('');
   const [loading, setLoading] = useState(false);
   const [logs, setLogs] = useState<QaLogItem[]>([]);
@@ -45,23 +40,20 @@ export default function MessageLogPage() {
   const [pageSize, setPageSize] = useState(20);
   const [total, setTotal] = useState(0);
 
+  const selectRobot = (nextRobotId?: string) => {
+    setRobotId(nextRobotId);
+    setLastSelectedRobotId(nextRobotId);
+  };
+
   const robotOptions = useMemo(
     () => robots.map((r) => ({ label: r.name ? `${r.name} (${r.robot_id})` : r.robot_id, value: r.robot_id })),
     [robots]
   );
 
   const loadRobots = async () => {
-    const items = loadLocalRobots();
+    const items = await api.listRobots();
     setRobots(items);
-    if (items.length === 0) {
-      setRobotId(undefined);
-      return;
-    }
-    const current = robotId;
-    const exists = current && items.some((x) => x.robot_id === current);
-    if (!exists) {
-      setRobotId(items[0].robot_id);
-    }
+    setRobotsLoaded(true);
   };
 
   const loadLogs = async (nextPage = page, nextPageSize = pageSize) => {
@@ -94,17 +86,20 @@ export default function MessageLogPage() {
   }, []);
 
   useEffect(() => {
-    void loadLogs(1, pageSize);
-  }, [robotId]);
+    if (!robotsLoaded) return;
+    if (robots.length === 0) {
+      selectRobot(undefined);
+      return;
+    }
+    const current = robotId;
+    const exists = current && robots.some((x: Robot) => x.robot_id === current);
+    if (!exists) {
+      selectRobot(robots[0].robot_id);
+    }
+  }, [robotsLoaded, robots, robotId]);
 
   useEffect(() => {
-    try {
-      if (robotId) {
-        localStorage.setItem(SELECTED_ROBOT_STORAGE_KEY, robotId);
-      }
-    } catch {
-      // ignore storage errors
-    }
+    void loadLogs(1, pageSize);
   }, [robotId]);
 
   return (
@@ -120,7 +115,7 @@ export default function MessageLogPage() {
         <Select
           style={{ width: 340 }}
           value={robotId}
-          onChange={setRobotId}
+          onChange={selectRobot}
           options={robotOptions}
           placeholder="选择机器人"
           showSearch
