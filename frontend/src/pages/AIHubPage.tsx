@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Button, Card, Form, Input, Modal, Popconfirm, Select, Space, Switch, Table, message } from 'antd';
+import { QuestionCircleOutlined } from '@ant-design/icons';
+import { Button, Card, Form, Input, Modal, Popconfirm, Popover, Select, Space, Switch, Table, Typography, message } from 'antd';
 import { api } from '../api';
 import type { Provider } from '../types';
 
@@ -16,11 +17,17 @@ export default function AIHubPage() {
   const [editing, setEditing] = useState<Provider | null>(null);
   const [providerType, setProviderType] = useState<'openai' | 'openclaw'>('openai');
   const [useCustomOpenaiUrl, setUseCustomOpenaiUrl] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [form] = Form.useForm();
 
   const load = async () => {
-    const ps = await api.listProviders();
-    setItems(ps);
+    try {
+      const ps = await api.listProviders();
+      setItems(ps);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '加载AI回复引擎失败，请刷新页面后重试。');
+    }
   };
 
   useEffect(() => {
@@ -28,35 +35,103 @@ export default function AIHubPage() {
   }, []);
 
   const submit = async () => {
-    const values = await form.validateFields();
-    if (values.provider_type === 'openai' && values.base_url_preset && values.base_url_preset !== '__custom__') {
-      values.base_url = values.base_url_preset;
-    }
-    delete values.base_url_preset;
-    values.auth_scheme = values.provider_type === 'openclaw' ? 'x-openclaw-token' : 'bearer';
-    if (editing) {
-      if (!values.api_token) {
-        delete values.api_token;
+    try {
+      setSaving(true);
+      const values = await form.validateFields();
+      if (values.provider_type === 'openai' && values.base_url_preset && values.base_url_preset !== '__custom__') {
+        values.base_url = values.base_url_preset;
       }
-      await api.updateProvider(editing.id, values);
-      message.success('更新成功');
-    } else {
-      await api.createProvider(values);
-      message.success('创建成功');
+      delete values.base_url_preset;
+      values.auth_scheme = values.provider_type === 'openclaw' ? 'x-openclaw-token' : 'bearer';
+      if (editing) {
+        if (!values.api_token) {
+          delete values.api_token;
+        }
+        await api.updateProvider(editing.id, values);
+        message.success('AI回复引擎更新成功');
+      } else {
+        await api.createProvider(values);
+        message.success('AI回复引擎创建成功');
+      }
+      setOpen(false);
+      load();
+    } catch (e: any) {
+      message.error(`${e?.response?.data?.detail || e?.message || '保存失败'}。请检查 Base URL 和 API Token 是否可用后重试。`);
+    } finally {
+      setSaving(false);
     }
-    setOpen(false);
-    load();
+  };
+
+  const onTestProvider = async () => {
+    try {
+      const values = await form.validateFields();
+      if (values.provider_type === 'openai' && values.base_url_preset && values.base_url_preset !== '__custom__') {
+        values.base_url = values.base_url_preset;
+      }
+      delete values.base_url_preset;
+      values.auth_scheme = values.provider_type === 'openclaw' ? 'x-openclaw-token' : 'bearer';
+      if (editing) {
+        values.provider_id = editing.id;
+        if (!values.api_token) {
+          delete values.api_token;
+        }
+      }
+      setTesting(true);
+      const res = await api.providerTest(values);
+      const sec = Number(res?.elapsed_seconds || 0);
+      message.success(`测试成功，响应耗时 ${sec.toFixed(1)}s`);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || '测试失败');
+    } finally {
+      setTesting(false);
+    }
   };
 
   const onDeleteProvider = async (row: Provider) => {
-    await api.deleteProvider(row.id);
-    message.success('Provider 已删除');
-    await load();
+    try {
+      await api.deleteProvider(row.id);
+      message.success('AI回复引擎已删除');
+      await load();
+    } catch (e: any) {
+      message.error(`${e?.response?.data?.detail || e?.message || '删除失败'}。若该引擎已被规则引用，请先删除或修改对应规则。`);
+    }
   };
+
+  const baseUrlHelp = (
+    <Space direction="vertical" size={4}>
+      <div>这是啥：AI 服务接口地址。</div>
+      <div>为什么填：系统要通过它把用户问题发给模型。</div>
+      <div>怎么填：优先使用下拉默认地址，只有自建服务才手动填写。</div>
+      <div>示例：一般不用改，默认即可</div>
+    </Space>
+  );
+
+  const tokenHelp = (
+    <Space direction="vertical" size={4}>
+      <div>这是啥：你的模型访问凭证。</div>
+      <div>为什么填：没有 Token，模型服务会拒绝请求。</div>
+      <div>怎么填：去对应模型平台复制后粘贴。</div>
+      <div>示例：仅你自己的模型密钥，不会明文展示</div>
+    </Space>
+  );
+
+  const modelHelp = (
+    <Space direction="vertical" size={4}>
+      <div>这是啥：模型标识，部分平台也叫 model_id。</div>
+      <div>为什么填：同一个平台有多个模型，不填可能调用到错误模型。</div>
+      <div>怎么填：到模型平台控制台/API文档中查“模型名称”或“model_id”。</div>
+      <div>示例：doubao-seed-2.0-lite、gpt-4o-mini、Qwen/Qwen3-8B</div>
+    </Space>
+  );
 
   return (
     <Card
-      title="Provider"
+      title={(
+        <Space direction="vertical" size={0}>
+          <span>AI回复引擎</span>
+          <Typography.Text type="secondary">管理机器人回复时调用的模型服务</Typography.Text>
+        </Space>
+      )}
       extra={<Button type="primary" onClick={() => {
         setEditing(null);
         form.resetFields();
@@ -69,50 +144,64 @@ export default function AIHubPage() {
           base_url: OPENAI_BASE_OPTIONS[0].value
         });
         setOpen(true);
-      }}>新增 Provider</Button>}
+      }}>新增 AI回复引擎</Button>}
     >
       <Table
         rowKey="id"
         dataSource={items}
         columns={[
-          { title: 'ID', dataIndex: 'id', width: 80 },
+          {
+            title: '序号',
+            width: 80,
+            render: (_: unknown, __: Provider, index: number) => index + 1
+          },
           { title: '名称', dataIndex: 'name' },
           { title: '类型', dataIndex: 'provider_type', width: 110 },
           { title: 'Base URL', dataIndex: 'base_url', ellipsis: true },
           { title: 'Token', dataIndex: 'api_token_masked' },
-          { title: '状态', dataIndex: 'enabled', render: (v) => (v ? '启用' : '停用') },
+          {
+            title: '状态',
+            dataIndex: 'enabled',
+            render: (v, row: Provider) => (row.is_system ? '系统默认' : v ? '启用' : '停用')
+          },
           {
             title: '操作',
             render: (_, row: Provider) => (
               <Space>
-                <Button size="small" onClick={() => {
-                  setEditing(row);
-                  const nextType = row.provider_type || 'openai';
-                  setProviderType(nextType);
-                  const preset = OPENAI_BASE_OPTIONS.find((x) => x.value === row.base_url);
-                  const custom = nextType === 'openai' && !preset;
-                  setUseCustomOpenaiUrl(custom);
-                  form.setFieldsValue({
-                    name: row.name,
-                    base_url: row.base_url,
-                    base_url_preset: preset ? preset.value : '__custom__',
-                    model: row.model,
-                    provider_type: nextType,
-                    extra_json: row.extra_json || '',
-                    enabled: row.enabled
-                  });
-                  setOpen(true);
-                }}>编辑</Button>
-                <Popconfirm
-                  title="确认删除该 Provider？"
-                  description={`Provider ID: ${row.id}`}
-                  okText="删除"
-                  cancelText="取消"
-                  okButtonProps={{ danger: true }}
-                  onConfirm={() => void onDeleteProvider(row)}
-                >
-                  <Button size="small" danger>删除</Button>
-                </Popconfirm>
+                {row.can_manage === false ? (
+                  <Typography.Text type="secondary">无法修改</Typography.Text>
+                ) : (
+                  <>
+                    <Button size="small" onClick={() => {
+                      setEditing(row);
+                      const nextType = row.provider_type || 'openai';
+                      setProviderType(nextType);
+                      const preset = OPENAI_BASE_OPTIONS.find((x) => x.value === row.base_url);
+                      const custom = nextType === 'openai' && !preset;
+                      setUseCustomOpenaiUrl(custom);
+                      form.setFieldsValue({
+                        name: row.name,
+                        base_url: row.base_url,
+                        base_url_preset: preset ? preset.value : '__custom__',
+                        model: row.model,
+                        provider_type: nextType,
+                        extra_json: row.extra_json || '',
+                        enabled: row.enabled
+                      });
+                      setOpen(true);
+                    }}>编辑</Button>
+                    <Popconfirm
+                      title="确认删除该AI回复引擎？"
+                      description={`名称：${row.name || '-'}`}
+                      okText="删除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => void onDeleteProvider(row)}
+                    >
+                      <Button size="small" danger>删除</Button>
+                    </Popconfirm>
+                  </>
+                )}
               </Space>
             )
           }
@@ -120,10 +209,25 @@ export default function AIHubPage() {
       />
 
       <Modal
-        title={editing ? '编辑 Provider' : '新增 Provider'}
+        title={editing ? '编辑 AI回复引擎' : '新增 AI回复引擎'}
         open={open}
         onCancel={() => setOpen(false)}
-        onOk={submit}
+        footer={[
+          <Button
+            key="test"
+            onClick={() => void onTestProvider()}
+            loading={testing}
+            style={{ background: '#fff1f0', borderColor: '#ffccc7', color: '#cf1322' }}
+          >
+            测试接口
+          </Button>,
+          <Button key="cancel" onClick={() => setOpen(false)}>
+            取消
+          </Button>,
+          <Button key="ok" type="primary" loading={saving} onClick={() => void submit()}>
+            确定
+          </Button>
+        ]}
         destroyOnClose
         width={680}
       >
@@ -131,7 +235,7 @@ export default function AIHubPage() {
           <Form.Item name="name" label="名称" rules={[{ required: true }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="provider_type" label="Provider 类型" rules={[{ required: true }]}>
+          <Form.Item name="provider_type" label="引擎类型" rules={[{ required: true }]}>
             <Select
               onChange={(v: 'openai' | 'openclaw') => {
                 setProviderType(v);
@@ -151,14 +255,25 @@ export default function AIHubPage() {
                 }
               }}
               options={[
-                { label: 'openai', value: 'openai' },
-                { label: 'openclaw', value: 'openclaw' }
+                { label: 'openai(大模型)', value: 'openai' },
+                { label: 'openclaw(小龙虾)', value: 'openclaw' }
               ]}
             />
           </Form.Item>
           {providerType === 'openai' ? (
             <>
-              <Form.Item name="base_url_preset" label="Base URL" rules={[{ required: true }]}>
+              <Form.Item
+                name="base_url_preset"
+                label={(
+                  <Space size={6}>
+                    <span>Base URL</span>
+                    <Popover content={baseUrlHelp} trigger="hover" placement="right">
+                      <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                    </Popover>
+                  </Space>
+                )}
+                rules={[{ required: true }]}
+              >
                 <Select
                   options={OPENAI_BASE_OPTIONS}
                   onChange={(v: string) => {
@@ -175,20 +290,63 @@ export default function AIHubPage() {
                 />
               </Form.Item>
               {useCustomOpenaiUrl ? (
-                <Form.Item name="base_url" label="手动 Base URL" rules={[{ required: true }]}>
+                <Form.Item
+                  name="base_url"
+                  label={(
+                    <Space size={6}>
+                      <span>手动 Base URL</span>
+                      <Popover content={baseUrlHelp} trigger="hover" placement="right">
+                        <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                      </Popover>
+                    </Space>
+                  )}
+                  rules={[{ required: true }]}
+                >
                   <Input placeholder="https://your-endpoint/v1/chat/completions" />
                 </Form.Item>
               ) : null}
             </>
           ) : (
-            <Form.Item name="base_url" label="Base URL" rules={[{ required: true }]}>
+            <Form.Item
+              name="base_url"
+              label={(
+                <Space size={6}>
+                  <span>Base URL</span>
+                  <Popover content={baseUrlHelp} trigger="hover" placement="right">
+                    <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                  </Popover>
+                </Space>
+              )}
+              rules={[{ required: true }]}
+            >
               <Input />
             </Form.Item>
           )}
-          <Form.Item name="api_token" label="API Token" rules={editing ? [] : [{ required: true }]}>
+          <Form.Item
+            name="api_token"
+            label={(
+              <Space size={6}>
+                <span>API Token</span>
+                <Popover content={tokenHelp} trigger="hover" placement="right">
+                  <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                </Popover>
+              </Space>
+            )}
+            rules={editing ? [] : [{ required: true }]}
+          >
             <Input.Password placeholder={editing ? '留空表示不变更' : ''} />
           </Form.Item>
-          <Form.Item name="model" label="Model">
+          <Form.Item
+            name="model"
+            label={(
+              <Space size={6}>
+                <span>Model</span>
+                <Popover content={modelHelp} trigger="hover" placement="right">
+                  <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                </Popover>
+              </Space>
+            )}
+          >
             <Input />
           </Form.Item>
           <Form.Item

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Button, Card, Col, Input, Modal, Row, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
+import { Button, Card, Col, Input, Modal, Popover, Row, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
+import { QuestionCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
 import type { Robot } from '../types';
 import { getLastSelectedRobotId, setLastSelectedRobotId } from '../robotSelection';
@@ -64,6 +64,7 @@ export default function RobotInfoPage() {
   const [callbackInput, setCallbackInput] = useState('');
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [platformBinding, setPlatformBinding] = useState(false);
   const [deletingType, setDeletingType] = useState<number | null>(null);
 
   const robotOptions = useMemo(
@@ -201,33 +202,67 @@ export default function RobotInfoPage() {
     }
   };
 
+  const doSaveCallback = async (url: string) => {
+    const robotId = selectedRobotId as string;
+    if (tabKey === 'message') {
+      await api.bindRobotMessageCallback(robotId, url);
+      return;
+    }
+    if (tabKey === 'online_status') {
+      await api.bindRobotCallbackType(robotId, url, 5);
+      await api.bindRobotCallbackType(robotId, url, 6);
+      return;
+    }
+    const callbackType = tabToType[tabKey];
+    if (callbackType === null) {
+      throw new Error('不支持的回调类型');
+    }
+    await api.bindRobotCallbackType(robotId, url, callbackType);
+  };
+
   const onSaveCallback = async () => {
     if (!ensureCallbackInput()) return;
+    const url = callbackInput.trim();
     setSaving(true);
     try {
-      const robotId = selectedRobotId as string;
-      const url = callbackInput.trim();
-      if (tabKey === 'message') {
-        await api.bindRobotMessageCallback(robotId, url);
-      } else if (tabKey === 'online_status') {
-        await api.bindRobotCallbackType(robotId, url, 5);
-        await api.bindRobotCallbackType(robotId, url, 6);
-      } else {
-        const callbackType = tabToType[tabKey];
-        if (callbackType === null) {
-          throw new Error('不支持的回调类型');
-        }
-        await api.bindRobotCallbackType(robotId, url, callbackType);
-      }
-      message.success('绑定成功');
+      await doSaveCallback(url);
+      message.success('绑定成功，机器人将按该地址推送回调。');
       await loadInfo(selectedRobotId);
     } catch (e: any) {
       Modal.error({
         title: '绑定失败',
-        content: e?.response?.data?.detail || e?.message || '未知错误',
+        content: `${e?.response?.data?.detail || e?.message || '未知错误'}。请稍后重试；若仍失败，请检查该地址是否被 WorkTool 接受。`,
       });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onBindPlatformCallback = async () => {
+    if (!selectedRobotId) {
+      message.warning('请先选择机器人');
+      return;
+    }
+    setPlatformBinding(true);
+    try {
+      const settings = await api.getWorktoolSettings();
+      const template = String(settings?.callback_example_url || '').trim();
+      const fallback = `${window.location.origin}/api/v1/callback/qa/${selectedRobotId}`;
+      const resolved = (template || fallback).replace('{robot_id}', selectedRobotId);
+      if (!resolved || !/^https?:\/\//.test(resolved)) {
+        throw new Error('未拿到有效的平台回调地址');
+      }
+      setCallbackInput(resolved);
+      await doSaveCallback(resolved);
+      message.success('已切换为“由本平台处理回复消息”，并自动保存成功。默认无需再修改。');
+      await loadInfo(selectedRobotId);
+    } catch (e: any) {
+      Modal.error({
+        title: '自动设置失败',
+        content: `${e?.response?.data?.detail || e?.message || '未知错误'}。请稍后重试；若仍失败，请改为手动填写后保存。`,
+      });
+    } finally {
+      setPlatformBinding(false);
     }
   };
 
@@ -423,7 +458,12 @@ export default function RobotInfoPage() {
         />
         <div className="callback-form-row">
           <label>
-            <span className="required">*</span> 回调地址
+            <Space size={6}>
+              <span><span className="required">*</span> 回调地址</span>
+              <Popover content="如不了解消息回调接口开发，无需修改本配置。" trigger="hover" placement="right">
+                <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+              </Popover>
+            </Space>
           </label>
           <Input
             value={callbackInput}
@@ -437,6 +477,11 @@ export default function RobotInfoPage() {
           <Button type="link" onClick={onOpenCallbackDoc}>
             {callbackDoc.label}
           </Button>
+          {tabKey === 'message' ? (
+            <Button type="link" loading={platformBinding} onClick={onBindPlatformCallback}>
+              由本平台处理回复消息
+            </Button>
+          ) : null}
         </div>
       </Card>
     </Space>

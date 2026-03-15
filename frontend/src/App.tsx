@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { Button, Layout, Menu, Space, Typography } from 'antd';
 import {
   DashboardOutlined,
@@ -24,15 +24,18 @@ const { Header, Sider, Content } = Layout;
 
 export default function App() {
   const location = useLocation();
+  const navigate = useNavigate();
   const [enableTroubleshoot, setEnableTroubleshoot] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [authed, setAuthed] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [robotInitChecked, setRobotInitChecked] = useState(false);
 
   useEffect(() => {
     if (location.pathname === '/login') {
       setAuthed(false);
       setIsAdmin(false);
+      setRobotInitChecked(false);
       setAuthReady(true);
       return;
     }
@@ -40,6 +43,7 @@ export default function App() {
     if (!token) {
       setAuthed(false);
       setIsAdmin(false);
+      setRobotInitChecked(false);
       setAuthReady(true);
       return;
     }
@@ -87,13 +91,37 @@ export default function App() {
     };
   }, [authed]);
 
+  useEffect(() => {
+    if (!authed || location.pathname === '/login' || robotInitChecked) {
+      return;
+    }
+    let mounted = true;
+    api
+      .listRobots()
+      .then((robots) => {
+        if (!mounted) return;
+        setRobotInitChecked(true);
+        if ((robots || []).length === 0 && location.pathname !== '/robots') {
+          navigate('/robots', { replace: true });
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setRobotInitChecked(true);
+        }
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [authed, location.pathname, navigate, robotInitChecked]);
+
   const items = useMemo(() => {
     const baseItems = [
       { key: '/dashboard', icon: <DashboardOutlined />, label: <Link to="/dashboard">控制台</Link> },
       { key: '/robot-info', icon: <InfoCircleOutlined />, label: <Link to="/robot-info">机器人信息</Link> },
       { key: '/robots', icon: <RobotOutlined />, label: <Link to="/robots">机器人配置</Link> },
       { key: '/logs', icon: <FileTextOutlined />, label: <Link to="/logs">消息监控</Link> },
-      { key: '/providers', icon: <ApiOutlined />, label: <Link to="/providers">Provider</Link> }
+      { key: '/providers', icon: <ApiOutlined />, label: <Link to="/providers">AI回复引擎</Link> }
     ];
     if (enableTroubleshoot && isAdmin) {
       baseItems.push({ key: '/troubleshoot', icon: <SearchOutlined />, label: <Link to="/troubleshoot">机器人排查</Link> });
@@ -105,6 +133,10 @@ export default function App() {
   }, [enableTroubleshoot, isAdmin]);
 
   if (!authReady) {
+    return null;
+  }
+
+  if (authed && !robotInitChecked && location.pathname !== '/login') {
     return null;
   }
 

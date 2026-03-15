@@ -1,10 +1,33 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ArrowDownOutlined, ArrowUpOutlined } from '@ant-design/icons';
-import { Button, Card, Collapse, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, Tag, Typography, message } from 'antd';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { ArrowDownOutlined, ArrowUpOutlined, QuestionCircleOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Alert, Button, Card, Collapse, Form, Input, InputNumber, Modal, Popconfirm, Popover, Select, Space, Switch, Table, Tabs, Tag, Tour, Typography, message } from 'antd';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { Provider, Robot, Rule } from '../types';
 import { getLastSelectedRobotId, setLastSelectedRobotId } from '../robotSelection';
+
+function helpLabel(title: string, content: ReactNode) {
+  return (
+    <Space size={6}>
+      <span>{title}</span>
+      <Popover content={content} trigger="hover" placement="right">
+        <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+      </Popover>
+    </Space>
+  );
+}
+
+function matchModeLabel(mode?: 'all' | 'exact' | 'regex') {
+  if (mode === 'all') return '全部';
+  if (mode === 'exact') return '精准匹配';
+  return '模糊匹配';
+}
+
+function renderRuleMatcher(mode: 'all' | 'exact' | 'regex' | undefined, pattern?: string | null) {
+  const m = mode || 'regex';
+  if (m === 'all') return '全部';
+  return `${matchModeLabel(m)}：${(pattern || '').trim() || '-'}`;
+}
 
 export default function RobotPage() {
   const navigate = useNavigate();
@@ -23,6 +46,9 @@ export default function RobotPage() {
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [ruleForm] = Form.useForm();
   const [ruleSwitchLoading, setRuleSwitchLoading] = useState<number[]>([]);
+  const [providerRefreshing, setProviderRefreshing] = useState(false);
+  const [showAddRobotTour, setShowAddRobotTour] = useState(false);
+  const addRobotBtnRef = useRef<HTMLElement | null>(null);
 
   const selectRobot = (robotId?: string) => {
     setSelectedRobotId(robotId);
@@ -51,6 +77,19 @@ export default function RobotPage() {
     }
   };
 
+  const refreshProviders = async () => {
+    setProviderRefreshing(true);
+    try {
+      const providerRes = await api.listProviders();
+      setProviders(providerRes);
+      message.success('AI回复引擎列表已刷新');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '刷新AI回复引擎失败');
+    } finally {
+      setProviderRefreshing(false);
+    }
+  };
+
   useEffect(() => {
     const init = async () => {
       await loadRobots();
@@ -74,8 +113,22 @@ export default function RobotPage() {
     void loadRulesAndProviders(selectedRobotId);
   }, [selectedRobotId]);
 
+  useEffect(() => {
+    if (!robotsLoaded || items.length > 0) return;
+    try {
+      const tourKey = 'onboarding_add_robot_tour_v1';
+      const shown = localStorage.getItem(tourKey) === '1';
+      if (!shown) {
+        setShowAddRobotTour(true);
+        localStorage.setItem(tourKey, '1');
+      }
+    } catch {
+      setShowAddRobotTour(true);
+    }
+  }, [robotsLoaded, items.length]);
+
   const providerOptions = useMemo(
-    () => providers.map((p) => ({ label: `${p.name} (${p.id})`, value: p.id })),
+    () => providers.map((p) => ({ label: p.name || '未命名引擎', value: p.id })),
     [providers]
   );
   const robotOptions = useMemo(
@@ -95,9 +148,13 @@ export default function RobotPage() {
     const target = index + direction;
     if (index < 0 || target < 0 || target >= list.length) return;
     [list[index], list[target]] = [list[target], list[index]];
-    await api.reorderRules(selectedRobotId, ruleScene, list.map((r) => r.id));
-    message.success('规则排序已更新');
-    await loadRulesAndProviders(selectedRobotId);
+    try {
+      await api.reorderRules(selectedRobotId, ruleScene, list.map((r) => r.id));
+      message.success('规则排序已更新');
+      await loadRulesAndProviders(selectedRobotId);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '规则排序失败，请刷新后重试；若仍失败请检查该机器人规则是否被并发修改。');
+    }
   };
 
   const onCreateRobot = () => {
@@ -105,6 +162,8 @@ export default function RobotPage() {
     robotForm.resetFields();
     robotForm.setFieldsValue({
       name: '机器人',
+      group_default_reply: '收到',
+      private_default_reply: '收到',
       private_chat_enabled: true,
       group_chat_enabled: true,
       group_reply_only_when_mentioned: false
@@ -130,7 +189,7 @@ export default function RobotPage() {
     } catch (e: any) {
       Modal.error({
         title: '读取机器人失败',
-        content: e?.response?.data?.detail || e?.message || '未知错误',
+        content: `${e?.response?.data?.detail || e?.message || '未知错误'}。请先到“机器人信息”页确认该 robot_id 可用，再重试。`,
       });
     }
   };
@@ -157,19 +216,25 @@ export default function RobotPage() {
         const res = await api.createRobot(values);
         await loadRobots();
         selectRobot(values.robot_id);
-        if (res?.existed) {
-          message.success('机器人已存在');
-        } else if (res?.auto_bind_message_callback && res?.callback_url) {
-          message.success(`机器人创建成功，已自动绑定消息回调：${res.callback_url}`);
+        const baseText = res?.existed ? '机器人已存在，已添加到当前账号' : '机器人创建成功';
+        const callbackStatus = String(res?.callback_status || '');
+        if (callbackStatus === 'bound' && res?.callback_url) {
+          message.success(`${baseText}，已自动绑定默认消息回调：${res.callback_url}`);
+        } else if (callbackStatus === 'already_bound') {
+          message.success(`${baseText}，检测到已有消息回调，已保持原配置不变。`);
+        } else if (callbackStatus === 'no_default_url') {
+          message.warning(`${baseText}。系统未配置默认消息回调地址，请到“机器人信息”页手动绑定回调。`);
+        } else if (callbackStatus === 'bind_failed') {
+          message.warning(`${baseText}，但自动绑定回调失败。请到“机器人信息”页点击测试并手动绑定。`);
         } else {
-          message.success('机器人创建成功');
+          message.success(baseText);
         }
       }
       setRobotOpen(false);
     } catch (e: any) {
       Modal.error({
         title: editingRobotId ? '更新失败' : '创建失败',
-        content: e?.response?.data?.detail || e?.message || '未知错误',
+        content: `${e?.response?.data?.detail || e?.message || '未知错误'}。请检查 Robot ID 是否正确、是否已重复，以及必填项是否完整。`,
       });
     }
   };
@@ -184,6 +249,8 @@ export default function RobotPage() {
     ruleForm.setFieldsValue({
       robot_id: selectedRobotId,
       scene: ruleScene,
+      pattern_match_type: 'all',
+      content_match_type: 'all',
       enabled: true,
       priority: 100
     });
@@ -192,21 +259,47 @@ export default function RobotPage() {
 
   const onEditRule = (row: Rule) => {
     setEditingRule(row);
-    ruleForm.setFieldsValue(row);
+    ruleForm.setFieldsValue({
+      ...row,
+      pattern_match_type: row.pattern_match_type || 'regex',
+      content_match_type: row.content_match_type || 'regex',
+      pattern: row.pattern || '',
+      content_pattern: row.content_pattern || ''
+    });
     setRuleOpen(true);
   };
 
   const submitRule = async () => {
-    const values = await ruleForm.validateFields();
-    if (editingRule) {
-      await api.updateRule(editingRule.id, values);
-      message.success('规则更新成功');
-    } else {
-      await api.createRule(values);
-      message.success('规则创建成功');
+    try {
+      const values = await ruleForm.validateFields();
+      values.pattern_match_type = values.pattern_match_type || 'regex';
+      values.content_match_type = values.content_match_type || 'regex';
+      values.pattern = (values.pattern || '').trim();
+      values.content_pattern = (values.content_pattern || '').trim();
+      if (values.pattern_match_type !== 'all' && !values.pattern) {
+        message.warning('群名/昵称匹配方式为精准/模糊时，请填写匹配内容');
+        return;
+      }
+      if (values.content_match_type !== 'all' && !values.content_pattern) {
+        message.warning('聊天内容匹配方式为精准/模糊时，请填写匹配内容');
+        return;
+      }
+      if (editingRule) {
+        await api.updateRule(editingRule.id, values);
+        message.success('规则更新成功');
+      } else {
+        await api.createRule(values);
+        message.success('规则创建成功');
+      }
+      setRuleOpen(false);
+      await loadRulesAndProviders(selectedRobotId);
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.message || '未知错误';
+      Modal.error({
+        title: editingRule ? '规则更新失败' : '规则创建失败',
+        content: `${detail}。请重点检查“群名/昵称匹配规则（正则）”“聊天内容匹配规则（正则）”和“AI回复引擎”是否正确。`,
+      });
     }
-    setRuleOpen(false);
-    await loadRulesAndProviders(selectedRobotId);
   };
 
   const toggleRuleEnabled = async (row: Rule, enabled: boolean) => {
@@ -215,6 +308,8 @@ export default function RobotPage() {
       await api.updateRule(row.id, { enabled });
       setRules((prev) => prev.map((r) => (r.id === row.id ? { ...r, enabled } : r)));
       message.success(`规则已${enabled ? '启用' : '停用'}`);
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '更新规则状态失败，请刷新后重试。');
     } finally {
       setRuleSwitchLoading((prev) => prev.filter((id) => id !== row.id));
     }
@@ -228,7 +323,28 @@ export default function RobotPage() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
-      <Card title="机器人配置" extra={<Button type="primary" onClick={onCreateRobot}>新建机器人</Button>}>
+      <Card
+        title={(
+          <Space direction="vertical" size={0}>
+            <span>机器人配置</span>
+            <Typography.Text type="secondary">设置机器人在哪些情况下回复</Typography.Text>
+          </Space>
+        )}
+        extra={<Button ref={addRobotBtnRef as any} type="primary" onClick={onCreateRobot}>添加机器人</Button>}
+      >
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
+          添加机器人后，系统会自动检测消息回调；如果你还没有配置回调，会默认绑定到本系统回调地址。多数场景下你无需手动修改。
+        </Typography.Paragraph>
+        {robotsLoaded && items.length === 0 ? (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="先添加机器人"
+            description="当前还没有机器人，这是第一步。点击右上角“添加机器人”，填写 Robot ID 后即可开始配置自动回复。"
+            action={<Button size="small" type="primary" onClick={onCreateRobot}>立即添加</Button>}
+          />
+        ) : null}
         <Collapse
           defaultActiveKey={[]}
           items={[
@@ -271,6 +387,17 @@ export default function RobotPage() {
           ]}
         />
       </Card>
+      <Tour
+        open={showAddRobotTour}
+        onClose={() => setShowAddRobotTour(false)}
+        steps={[
+          {
+            title: '先添加机器人',
+            description: '你还没有机器人，请先点击这里添加。完成后再配置规则和AI回复引擎。',
+            target: () => (addRobotBtnRef.current || document.body) as HTMLElement,
+          }
+        ]}
+      />
 
       <Card
         title={`规则管理${selectedRobotId ? `（${selectedRobotId}）` : ''}`}
@@ -302,9 +429,20 @@ export default function RobotPage() {
           dataSource={sceneRules}
           pagination={false}
           columns={[
-            { title: 'ID', dataIndex: 'id', width: 80 },
-            { title: '正则规则', dataIndex: 'pattern' },
-            { title: 'Provider', dataIndex: 'provider_name' },
+            {
+              title: '序号',
+              width: 80,
+              render: (_: unknown, __: Rule, index: number) => index + 1
+            },
+            {
+              title: '群名/昵称匹配规则',
+              render: (_, row: Rule) => renderRuleMatcher(row.pattern_match_type, row.pattern)
+            },
+            {
+              title: '聊天内容匹配规则',
+              render: (_, row: Rule) => renderRuleMatcher(row.content_match_type, row.content_pattern)
+            },
+            { title: 'AI回复引擎', dataIndex: 'provider_name' },
             { title: '优先级', dataIndex: 'priority', width: 100 },
             {
               title: '启用',
@@ -336,7 +474,7 @@ export default function RobotPage() {
                   <Button size="small" onClick={() => onEditRule(row)}>编辑</Button>
                   <Popconfirm
                     title="确认删除该规则？"
-                    description={`规则ID: ${row.id}`}
+                    description={`群名/昵称：${renderRuleMatcher(row.pattern_match_type, row.pattern)}；聊天内容：${renderRuleMatcher(row.content_match_type, row.content_pattern)}`}
                     okText="删除"
                     cancelText="取消"
                     okButtonProps={{ danger: true }}
@@ -352,7 +490,7 @@ export default function RobotPage() {
       </Card>
 
       <Modal
-        title={editingRobotId ? '编辑机器人' : '新建机器人'}
+        title={editingRobotId ? '编辑机器人' : '添加机器人'}
         open={robotOpen}
         onCancel={() => setRobotOpen(false)}
         onOk={submitRobot}
@@ -360,7 +498,19 @@ export default function RobotPage() {
         width={720}
       >
         <Form form={robotForm} layout="vertical">
-          <Form.Item name="robot_id" label="Robot ID" rules={[{ required: true }]}>
+          <Form.Item
+            name="robot_id"
+            label={helpLabel(
+              'Robot ID',
+              <Space direction="vertical" size={4}>
+                <div>这是啥：WorkTool 里的机器人唯一编号。</div>
+                <div>为什么填：系统靠它识别你要配置哪台机器人。</div>
+                <div>怎么填：去 WorkTool 机器人详情页复制后粘贴。</div>
+                <div>示例：wtxxxx</div>
+              </Space>
+            )}
+            rules={[{ required: true }]}
+          >
             <Input disabled={!!editingRobotId} />
           </Form.Item>
           <Form.Item name="name" label="名称（选填）">
@@ -406,20 +556,148 @@ export default function RobotPage() {
               ]}
             />
           </Form.Item>
-          <Form.Item name="pattern" label="匹配规则（正则）" rules={[{ required: true }]}>
-            <Input />
+          <Form.Item
+            name="pattern_match_type"
+            label={helpLabel(
+              '群名/昵称匹配方式',
+              <Space direction="vertical" size={4}>
+                <div>这是啥：控制群名/昵称按什么方式命中。</div>
+                <div>为什么填：不同场景需要不同的命中精度。</div>
+                <div>怎么填：可选全部、精准匹配、模糊匹配。</div>
+                <div>示例：精准匹配=财务群；模糊匹配=财务</div>
+              </Space>
+            )}
+            rules={[{ required: true }]}
+          >
+            <Select
+              options={[
+                { label: '全部', value: 'all' },
+                { label: '精准匹配', value: 'exact' },
+                { label: '模糊匹配', value: 'regex' }
+              ]}
+            />
+          </Form.Item>
+          <Form.Item
+            shouldUpdate={(prev, next) => prev.pattern_match_type !== next.pattern_match_type}
+            noStyle
+          >
+            {({ getFieldValue }) => {
+              const mode = getFieldValue('pattern_match_type') || 'regex';
+              const disabled = mode === 'all';
+              return (
+                <Form.Item
+                  name="pattern"
+                  label={(
+                    <Space size={6}>
+                      <span>群名/昵称匹配内容</span>
+                      <Popover
+                        content={(
+                          <Space direction="vertical" size={4}>
+                            <div>大多数场景直接填关键词即可，可按“包含匹配”理解（类似 like %关键词%）。</div>
+                            <div>也支持正则表达式（进阶）：</div>
+                            <div>示例1：`财务`（命中“财务群”“上海财务部”）</div>
+                            <div>示例2：`^财务群$`（仅精确命中“财务群”）</div>
+                            <div>示例3：`(财务|报销).*群`（复杂条件）</div>
+                          </Space>
+                        )}
+                        trigger="hover"
+                        placement="right"
+                      >
+                        <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                      </Popover>
+                    </Space>
+                  )}
+                  tooltip={disabled ? '当前为“全部”，无需填写。' : mode === 'exact' ? '将按完全一致匹配。' : '默认按包含匹配理解即可，例如填“财务”就能命中“财务群”。'}
+                >
+                  <Input disabled={disabled} placeholder={disabled ? '全部匹配时无需填写' : mode === 'exact' ? '例如：财务群' : '例如：财务'} />
+                </Form.Item>
+              );
+            }}
+          </Form.Item>
+          <Form.Item
+            name="content_match_type"
+            label={helpLabel(
+              '聊天内容匹配方式',
+              <Space direction="vertical" size={4}>
+                <div>这是啥：控制用户聊天内容按什么方式命中。</div>
+                <div>为什么填：可把不同问题路由到不同回复策略。</div>
+                <div>怎么填：可选全部、精准匹配、模糊匹配。</div>
+                <div>示例：精准匹配=报销流程；模糊匹配=报销</div>
+              </Space>
+            )}
+            rules={[{ required: true }]}
+          >
+            <Select
+              options={[
+                { label: '全部', value: 'all' },
+                { label: '精准匹配', value: 'exact' },
+                { label: '模糊匹配', value: 'regex' }
+              ]}
+            />
+          </Form.Item>
+          <Form.Item
+            shouldUpdate={(prev, next) => prev.content_match_type !== next.content_match_type}
+            noStyle
+          >
+            {({ getFieldValue }) => {
+              const mode = getFieldValue('content_match_type') || 'regex';
+              const disabled = mode === 'all';
+              return (
+                <Form.Item
+                  name="content_pattern"
+                  label={(
+                    <Space size={6}>
+                      <span>聊天内容匹配内容</span>
+                      <Popover
+                        content={(
+                          <Space direction="vertical" size={4}>
+                            <div>大多数场景直接填关键词即可，可按“包含匹配”理解（类似 like %关键词%）。</div>
+                            <div>也支持正则表达式（进阶）：</div>
+                            <div>示例1：`报销`（命中“怎么报销”“报销流程”）</div>
+                            <div>示例2：`^报销流程$`（仅精确命中“报销流程”）</div>
+                            <div>示例3：`(报销|差旅).*标准`（复杂条件）</div>
+                          </Space>
+                        )}
+                        trigger="hover"
+                        placement="right"
+                      >
+                        <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                      </Popover>
+                    </Space>
+                  )}
+                  tooltip={disabled ? '当前为“全部”，无需填写。' : mode === 'exact' ? '将按完全一致匹配。' : '默认按包含匹配理解即可；需要时可用正则表达式。'}
+                >
+                  <Input disabled={disabled} placeholder={disabled ? '全部匹配时无需填写' : mode === 'exact' ? '例如：报销流程' : '例如：报销'} />
+                </Form.Item>
+              );
+            }}
           </Form.Item>
           <Form.Item
             name="provider_id"
             label={(
               <Space size={8}>
-                <span>Provider</span>
-                <Button size="small" type="link" style={{ padding: 0, height: 'auto' }} onClick={() => navigate('/providers')}>
-                  新增 Provider
+                <span>AI回复引擎</span>
+                <Button
+                  size="small"
+                  type="link"
+                  style={{ padding: 0, height: 'auto' }}
+                  onClick={() => window.open('/providers', '_blank', 'noopener,noreferrer')}
+                >
+                  新增 AI回复引擎
+                </Button>
+                <Button
+                  size="small"
+                  type="link"
+                  icon={<ReloadOutlined />}
+                  style={{ padding: 0, height: 'auto' }}
+                  loading={providerRefreshing}
+                  onClick={() => void refreshProviders()}
+                >
+                  刷新
                 </Button>
               </Space>
             )}
-            rules={[{ required: true }]}
+            rules={[{ required: true, message: '请选择AI回复引擎' }]}
           >
             <Select options={providerOptions} />
           </Form.Item>
