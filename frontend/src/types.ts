@@ -18,13 +18,18 @@ export interface Provider {
   extra_json?: string | null;
   enabled: boolean;
   api_token_masked: string;
+  is_system?: boolean;
+  can_manage?: boolean;
 }
 
 export interface Rule {
   id: number;
   robot_id: string;
   scene: 'group' | 'private';
+  pattern_match_type?: 'all' | 'exact' | 'regex';
   pattern: string;
+  content_match_type?: 'all' | 'exact' | 'regex';
+  content_pattern?: string | null;
   provider_id: number;
   provider_name: string;
   priority: number;

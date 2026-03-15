@@ -6,7 +6,9 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
     environment:
+      TZ: Asia/Shanghai
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-worktool_bridge}
       MYSQL_USER: ${MYSQL_USER:-worktool}
@@ -37,6 +39,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     environment:
+      TZ: Asia/Shanghai
       PYTHONUNBUFFERED: ${PYTHONUNBUFFERED:-1}
       APP_MYSQL_HOST: ${APP_MYSQL_HOST:-}
       APP_MYSQL_PORT: ${APP_MYSQL_PORT:-3306}
@@ -62,6 +65,11 @@ services:
       SMS_HUARUI_APPSECRET: ${SMS_HUARUI_APPSECRET:-}
       SMS_HUARUI_SIGN: ${SMS_HUARUI_SIGN:-【南京亚美达科技】}
       SMS_CODE_EXPIRE_MINUTES: ${SMS_CODE_EXPIRE_MINUTES:-15}
+      DEFAULT_TEST_PROVIDER_ENABLED: ${DEFAULT_TEST_PROVIDER_ENABLED:-false}
+      DEFAULT_TEST_PROVIDER_NAME: ${DEFAULT_TEST_PROVIDER_NAME:-AI模型(仅测试用)}
+      DEFAULT_TEST_PROVIDER_BASE_URL: ${DEFAULT_TEST_PROVIDER_BASE_URL:-https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions}
+      DEFAULT_TEST_PROVIDER_API_KEY: ${DEFAULT_TEST_PROVIDER_API_KEY:-}
+      DEFAULT_TEST_PROVIDER_MODEL: ${DEFAULT_TEST_PROVIDER_MODEL:-doubao-seed-2.0-lite}
     logging:
       driver: json-file
       options:
