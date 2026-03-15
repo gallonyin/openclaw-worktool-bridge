@@ -418,6 +418,64 @@ def init_db() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS forward_rules (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  created_by BIGINT NOT NULL,
+                  source_robot_pk BIGINT NOT NULL,
+                  source_scene ENUM('group','private') NOT NULL,
+                  source_match_type ENUM('all','exact','regex') NOT NULL DEFAULT 'all',
+                  source_pattern VARCHAR(255) NULL,
+                  target_name VARCHAR(255) NOT NULL,
+                  use_other_robot TINYINT(1) NOT NULL DEFAULT 0,
+                  send_robot_pk BIGINT NULL,
+                  prefix_enabled TINYINT(1) NOT NULL DEFAULT 1,
+                  prefix_template VARCHAR(255) NULL,
+                  keyword_match_type ENUM('all','exact','regex') NOT NULL DEFAULT 'all',
+                  keyword_pattern VARCHAR(255) NULL,
+                  enabled TINYINT(1) NOT NULL DEFAULT 1,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  INDEX idx_fr_source (source_robot_pk, source_scene, enabled),
+                  INDEX idx_fr_created_by (created_by),
+                  CONSTRAINT fk_fr_created_by FOREIGN KEY (created_by) REFERENCES users(id),
+                  CONSTRAINT fk_fr_source_robot FOREIGN KEY (source_robot_pk) REFERENCES robots(id) ON DELETE CASCADE,
+                  CONSTRAINT fk_fr_send_robot FOREIGN KEY (send_robot_pk) REFERENCES robots(id) ON DELETE SET NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS forward_logs (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  rule_id BIGINT NOT NULL,
+                  source_robot_pk BIGINT NOT NULL,
+                  send_robot_pk BIGINT NOT NULL,
+                  source_scene ENUM('group','private') NOT NULL,
+                  source_name VARCHAR(255) NULL,
+                  sender_name VARCHAR(255) NULL,
+                  target_name VARCHAR(255) NOT NULL,
+                  message_id VARCHAR(255) NULL,
+                  question_text TEXT NULL,
+                  forwarded_text TEXT NULL,
+                  status ENUM('success','failed','skipped') NOT NULL DEFAULT 'success',
+                  error_reason VARCHAR(512) NULL,
+                  time_cost DECIMAL(10,3) NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  INDEX idx_fl_source_robot_time (source_robot_pk, created_at),
+                  INDEX idx_fl_rule_time (rule_id, created_at),
+                  CONSTRAINT fk_fl_rule FOREIGN KEY (rule_id) REFERENCES forward_rules(id) ON DELETE CASCADE,
+                  CONSTRAINT fk_fl_source_robot FOREIGN KEY (source_robot_pk) REFERENCES robots(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute("SHOW COLUMNS FROM forward_rules LIKE 'target_type'")
+            if cur.fetchone():
+                cur.execute("ALTER TABLE forward_rules DROP COLUMN target_type")
+            cur.execute("SHOW COLUMNS FROM forward_logs LIKE 'target_type'")
+            if cur.fetchone():
+                cur.execute("ALTER TABLE forward_logs DROP COLUMN target_type")
 
             cur.execute("SELECT 1 FROM app_settings WHERE `key`='worktool_api_base' LIMIT 1")
             if not cur.fetchone():
@@ -814,6 +872,36 @@ class ReorderPayload(BaseModel):
     rule_ids: List[int] = Field(default_factory=list)
 
 
+class ForwardRuleCreate(BaseModel):
+    source_robot_id: str
+    source_scene: Literal["group", "private"]
+    source_match_type: Literal["all", "exact", "regex"] = "all"
+    source_pattern: Optional[str] = None
+    target_name: str
+    use_other_robot: bool = False
+    send_robot_id: Optional[str] = None
+    prefix_enabled: bool = True
+    prefix_template: Optional[str] = None
+    keyword_match_type: Literal["all", "exact", "regex"] = "all"
+    keyword_pattern: Optional[str] = None
+    enabled: bool = True
+
+
+class ForwardRuleUpdate(BaseModel):
+    source_robot_id: Optional[str] = None
+    source_scene: Optional[Literal["group", "private"]] = None
+    source_match_type: Optional[Literal["all", "exact", "regex"]] = None
+    source_pattern: Optional[str] = None
+    target_name: Optional[str] = None
+    use_other_robot: Optional[bool] = None
+    send_robot_id: Optional[str] = None
+    prefix_enabled: Optional[bool] = None
+    prefix_template: Optional[str] = None
+    keyword_match_type: Optional[Literal["all", "exact", "regex"]] = None
+    keyword_pattern: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
 class MessageCallbackPayload(BaseModel):
     robot_id: str
     callback_url: str
@@ -860,8 +948,28 @@ def _get_robot_by_id_or_404(robot_id: str) -> Dict[str, Any]:
         conn.close()
 
 
+def _get_robot_by_pk_or_404(robot_pk: int) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM robots WHERE id=%s LIMIT 1", (int(robot_pk),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="robot not found")
+            return row
+    finally:
+        conn.close()
+
+
 def _require_robot_access(user_id: int, robot_id: str) -> Dict[str, Any]:
     row = _get_robot_by_id_or_404(robot_id)
+    if int(row["id"]) not in _bound_robot_pk_set(user_id):
+        raise HTTPException(status_code=403, detail="无权访问该机器人")
+    return row
+
+
+def _require_robot_access_by_pk(user_id: int, robot_pk: int) -> Dict[str, Any]:
+    row = _get_robot_by_pk_or_404(int(robot_pk))
     if int(row["id"]) not in _bound_robot_pk_set(user_id):
         raise HTTPException(status_code=403, detail="无权访问该机器人")
     return row
@@ -1186,6 +1294,191 @@ def _mode_rank(match_type: str) -> int:
     return 2
 
 
+def _forward_source_name(scene: str, req: QARequest) -> str:
+    if scene == "group":
+        return (req.groupName or "").strip()
+    return (req.receivedName or "").strip()
+
+
+def _build_forward_prefix(rule: Dict[str, Any], scene: str, req: QARequest) -> str:
+    if not bool(rule.get("prefix_enabled")):
+        return ""
+    tpl = str(rule.get("prefix_template") or "").strip()
+    if not tpl:
+        if scene == "group":
+            tpl = "[转发自群:{group_name} 提问者:{sender_name}] "
+        else:
+            tpl = "[转发自:{sender_name}] "
+    group_name = (req.groupName or "").strip()
+    sender_name = (req.receivedName or "").strip()
+    source_name = _forward_source_name(scene, req)
+    return (
+        tpl.replace("{group_name}", group_name)
+        .replace("{sender_name}", sender_name)
+        .replace("{source_name}", source_name)
+    )
+
+
+def _insert_forward_log(
+    rule_id: int,
+    source_robot_pk: int,
+    send_robot_pk: int,
+    source_scene: str,
+    source_name: str,
+    sender_name: str,
+    target_name: str,
+    message_id: str,
+    question_text: str,
+    forwarded_text: str,
+    status: str,
+    error_reason: str = "",
+    time_cost: Optional[float] = None,
+) -> None:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO forward_logs(
+                  rule_id,source_robot_pk,send_robot_pk,source_scene,source_name,sender_name,target_name,
+                  message_id,question_text,forwarded_text,status,error_reason,time_cost
+                )
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    int(rule_id),
+                    int(source_robot_pk),
+                    int(send_robot_pk),
+                    source_scene,
+                    source_name[:255],
+                    sender_name[:255],
+                    target_name[:255],
+                    (message_id or "")[:255],
+                    (question_text or "")[:4000],
+                    (forwarded_text or "")[:4000],
+                    status,
+                    (error_reason or "")[:512],
+                    None if time_cost is None else round(float(time_cost), 3),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        logger.warning("forward_log_insert_failed rule_id=%s err=%s", rule_id, str(e))
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _load_enabled_forward_rules(source_robot_pk: int, scene: str) -> List[Dict[str, Any]]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT fr.*,sr.robot_id AS send_robot_id
+                FROM forward_rules fr
+                LEFT JOIN robots sr ON sr.id=fr.send_robot_pk
+                WHERE fr.source_robot_pk=%s AND fr.source_scene=%s AND fr.enabled=1
+                ORDER BY fr.id ASC
+                """,
+                (int(source_robot_pk), scene),
+            )
+            return cur.fetchall() or []
+    finally:
+        conn.close()
+
+
+async def _run_forwarding_for_callback(robot: Dict[str, Any], scene: str, req: QARequest, inbound_text: str) -> None:
+    # v1: only text messages are forwarded.
+    if int(req.textType or 0) != 1:
+        return
+    source_robot_pk = int(robot["id"])
+    source_robot_id = str(robot.get("robot_id") or "")
+    source_name = _forward_source_name(scene, req)
+    sender_name = (req.receivedName or "").strip()
+    message_id = _pick_message_id(req)
+    rules = _load_enabled_forward_rules(source_robot_pk, scene)
+    for rule in rules:
+        rule_id = int(rule.get("id") or 0)
+        source_match_type = str(rule.get("source_match_type") or "all")
+        source_pattern = str(rule.get("source_pattern") or "")
+        if not _match_with_mode(source_match_type, source_pattern, source_name):
+            continue
+        keyword_match_type = str(rule.get("keyword_match_type") or "all")
+        keyword_pattern = str(rule.get("keyword_pattern") or "")
+        if not _match_with_mode(keyword_match_type, keyword_pattern, inbound_text):
+            continue
+        send_robot_id = source_robot_id
+        send_robot_pk = source_robot_pk
+        if bool(rule.get("use_other_robot")) and rule.get("send_robot_id"):
+            send_robot_id = str(rule.get("send_robot_id") or "").strip() or source_robot_id
+            send_robot_pk = int(rule.get("send_robot_pk") or source_robot_pk)
+        target_name = str(rule.get("target_name") or "").strip()
+        if not target_name:
+            _insert_forward_log(
+                rule_id=rule_id,
+                source_robot_pk=source_robot_pk,
+                send_robot_pk=send_robot_pk,
+                source_scene=scene,
+                source_name=source_name,
+                sender_name=sender_name,
+                target_name="",
+                message_id=message_id,
+                question_text=inbound_text,
+                forwarded_text="",
+                status="skipped",
+                error_reason="target_name empty",
+                time_cost=0,
+            )
+            continue
+        prefix = _build_forward_prefix(rule, scene, req)
+        forwarded_text = f"{prefix}{inbound_text}"
+        started = time.perf_counter()
+        try:
+            await _send_worktool_text_to_target(send_robot_id, target_name, forwarded_text)
+            _insert_forward_log(
+                rule_id=rule_id,
+                source_robot_pk=source_robot_pk,
+                send_robot_pk=send_robot_pk,
+                source_scene=scene,
+                source_name=source_name,
+                sender_name=sender_name,
+                target_name=target_name,
+                message_id=message_id,
+                question_text=inbound_text,
+                forwarded_text=forwarded_text,
+                status="success",
+                time_cost=time.perf_counter() - started,
+            )
+        except Exception as e:
+            logger.warning(
+                "forward_send_failed rule_id=%s source_robot=%s send_robot=%s target=%s err=%s",
+                rule_id,
+                source_robot_id,
+                send_robot_id,
+                target_name,
+                str(e),
+            )
+            _insert_forward_log(
+                rule_id=rule_id,
+                source_robot_pk=source_robot_pk,
+                send_robot_pk=send_robot_pk,
+                source_scene=scene,
+                source_name=source_name,
+                sender_name=sender_name,
+                target_name=target_name,
+                message_id=message_id,
+                question_text=inbound_text,
+                forwarded_text=forwarded_text,
+                status="failed",
+                error_reason=str(e),
+                time_cost=time.perf_counter() - started,
+            )
+
+
 def _insert_message_log(robot_pk: int, direction: str, scene: str, content: str, status: str) -> None:
     conn = db_conn()
     try:
@@ -1400,8 +1693,7 @@ async def _call_provider(rule: Dict[str, Any], prompt: str) -> str:
             return text
 
 
-async def _send_worktool_text(robot_id: str, scene: str, req: QARequest, text: str) -> Dict[str, Any]:
-    target = _rule_match_target(scene, req)
+async def _send_worktool_text_to_target(robot_id: str, target: str, text: str) -> Dict[str, Any]:
     if not target:
         raise HTTPException(status_code=400, detail="worktool target empty")
     url = f"{get_worktool_api_base()}/wework/sendRawMessage"
@@ -1417,9 +1709,8 @@ async def _send_worktool_text(robot_id: str, scene: str, req: QARequest, text: s
     }
     started = time.perf_counter()
     logger.info(
-        "worktool_send_start robot_id=%s scene=%s target=%s text=%s",
+        "worktool_send_start robot_id=%s target=%s text=%s",
         robot_id,
-        scene,
         _short_text(target, 80),
         _short_text(text, 160),
     )
@@ -1461,6 +1752,11 @@ async def _send_worktool_text(robot_id: str, scene: str, req: QARequest, text: s
             return data if isinstance(data, dict) else {"raw": raw}
 
 
+async def _send_worktool_text(robot_id: str, scene: str, req: QARequest, text: str) -> Dict[str, Any]:
+    target = _rule_match_target(scene, req)
+    return await _send_worktool_text_to_target(robot_id, target, text)
+
+
 # ----- lifecycle -----
 @app.on_event("startup")
 async def startup() -> None:
@@ -1486,13 +1782,13 @@ async def auth_sms_send(body: SmsSendRequest, request: Request) -> Dict[str, Any
             )
             latest = cur.fetchone()
             if latest and isinstance(latest.get("created_at"), datetime):
-                if (datetime.utcnow() - latest["created_at"]).total_seconds() < 60:
+                if (datetime.now() - latest["created_at"]).total_seconds() < 60:
                     raise HTTPException(status_code=429, detail="发送过于频繁，请稍后再试")
 
             cur.execute(
                 """
                 SELECT COUNT(1) AS c FROM sms_codes
-                WHERE phone=%s AND scene=%s AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)
+                WHERE phone=%s AND scene=%s AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
                 """,
                 (phone, body.scene),
             )
@@ -1519,7 +1815,7 @@ async def auth_sms_send(body: SmsSendRequest, request: Request) -> Dict[str, Any
             cur.execute(
                 """
                 INSERT INTO app_sms_record(account, source, source_ip, phone, sign, content, send_time, msgid, result)
-                VALUES(%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(),%s,%s)
+                VALUES(%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
                 """,
                 (SMS_HUARUI_APPKEY or "-", f"auth:{body.scene}", source_ip, phone, SMS_HUARUI_SIGN, content[:512], sms_uid, result_json),
             )
@@ -1527,7 +1823,7 @@ async def auth_sms_send(body: SmsSendRequest, request: Request) -> Dict[str, Any
                 cur.execute(
                     """
                     INSERT INTO sms_codes(phone, scene, code_hash, expire_at, request_ip)
-                    VALUES(%s,%s,%s,DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s MINUTE),%s)
+                    VALUES(%s,%s,%s,DATE_ADD(NOW(), INTERVAL %s MINUTE),%s)
                     """,
                     (phone, body.scene, _hash_sms_code(code), SMS_CODE_EXPIRE_MINUTES, source_ip),
                 )
@@ -2375,6 +2671,303 @@ async def reorder_rules(robot_id: str, scene: str, body: ReorderPayload, user: D
     return {"ok": True}
 
 
+@app.get("/api/v1/forwards")
+async def list_forward_rules(
+    source_robot_id: Optional[str] = None,
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    uid = int(user["id"])
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = (
+                """
+                SELECT fr.*,
+                       sr.robot_id AS source_robot_id,sr.name AS source_robot_name,
+                       rr.robot_id AS send_robot_id,rr.name AS send_robot_name
+                FROM forward_rules fr
+                JOIN robots sr ON sr.id=fr.source_robot_pk
+                LEFT JOIN robots rr ON rr.id=fr.send_robot_pk
+                JOIN user_robots ur ON ur.robot_pk=fr.source_robot_pk AND ur.user_id=%s
+                WHERE fr.created_by=%s
+                """
+            )
+            params: List[Any] = [uid, uid]
+            if source_robot_id:
+                sql += " AND sr.robot_id=%s"
+                params.append(source_robot_id)
+            sql += " ORDER BY fr.id DESC"
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall() or []
+            items: List[Dict[str, Any]] = []
+            for row in rows:
+                items.append(
+                    {
+                        "id": int(row["id"]),
+                        "source_robot_id": row.get("source_robot_id"),
+                        "source_robot_name": row.get("source_robot_name") or "",
+                        "source_scene": row.get("source_scene"),
+                        "source_match_type": row.get("source_match_type"),
+                        "source_pattern": row.get("source_pattern") or "",
+                        "target_name": row.get("target_name") or "",
+                        "use_other_robot": bool(row.get("use_other_robot")),
+                        "send_robot_id": row.get("send_robot_id"),
+                        "send_robot_name": row.get("send_robot_name") or "",
+                        "prefix_enabled": bool(row.get("prefix_enabled")),
+                        "prefix_template": row.get("prefix_template") or "",
+                        "keyword_match_type": row.get("keyword_match_type"),
+                        "keyword_pattern": row.get("keyword_pattern") or "",
+                        "enabled": bool(row.get("enabled")),
+                        "created_at": row.get("created_at"),
+                        "updated_at": row.get("updated_at"),
+                    }
+                )
+            return {"items": items}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/forwards")
+async def create_forward_rule(body: ForwardRuleCreate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    uid = int(user["id"])
+    source_robot = _require_robot_access(uid, body.source_robot_id)
+    source_match_type = body.source_match_type
+    source_pattern = (body.source_pattern or "").strip()
+    if source_match_type != "all" and not source_pattern:
+        raise HTTPException(status_code=400, detail="来源对象匹配为精准/模糊时，请填写来源对象")
+    target_name = (body.target_name or "").strip()
+    if not target_name:
+        raise HTTPException(status_code=400, detail="目标名称不能为空")
+    keyword_match_type = body.keyword_match_type
+    keyword_pattern = (body.keyword_pattern or "").strip()
+    if keyword_match_type != "all" and not keyword_pattern:
+        raise HTTPException(status_code=400, detail="关键词匹配为精准/模糊时，请填写关键词")
+    send_robot_pk: Optional[int] = None
+    if body.use_other_robot:
+        if not (body.send_robot_id or "").strip():
+            raise HTTPException(status_code=400, detail="已开启“使用其他机器人发送”，请先选择发送机器人")
+        send_robot = _require_robot_access(uid, body.send_robot_id or "")
+        send_robot_pk = int(send_robot["id"])
+    prefix_template = (body.prefix_template or "").strip() or None
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO forward_rules(
+                  created_by,source_robot_pk,source_scene,source_match_type,source_pattern,target_name,
+                  use_other_robot,send_robot_pk,prefix_enabled,prefix_template,keyword_match_type,keyword_pattern,enabled
+                )
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    uid,
+                    int(source_robot["id"]),
+                    body.source_scene,
+                    source_match_type,
+                    source_pattern or None,
+                    target_name,
+                    1 if body.use_other_robot else 0,
+                    send_robot_pk,
+                    1 if body.prefix_enabled else 0,
+                    prefix_template,
+                    keyword_match_type,
+                    keyword_pattern or None,
+                    1 if body.enabled else 0,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.put("/api/v1/forwards/{rule_id}")
+async def update_forward_rule(rule_id: int, body: ForwardRuleUpdate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    uid = int(user["id"])
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM forward_rules WHERE id=%s AND created_by=%s LIMIT 1", (rule_id, uid))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="转发规则不存在")
+
+            source_robot_pk = int(row["source_robot_pk"])
+            if body.source_robot_id is not None:
+                source_robot = _require_robot_access(uid, body.source_robot_id)
+                source_robot_pk = int(source_robot["id"])
+
+            source_scene = body.source_scene if body.source_scene is not None else row.get("source_scene")
+            source_match_type = body.source_match_type if body.source_match_type is not None else row.get("source_match_type")
+            source_pattern = (
+                body.source_pattern.strip()
+                if body.source_pattern is not None
+                else str(row.get("source_pattern") or "").strip()
+            )
+            if source_match_type != "all" and not source_pattern:
+                raise HTTPException(status_code=400, detail="来源对象匹配为精准/模糊时，请填写来源对象")
+
+            target_name = (
+                body.target_name.strip()
+                if body.target_name is not None
+                else str(row.get("target_name") or "").strip()
+            )
+            if not target_name:
+                raise HTTPException(status_code=400, detail="目标名称不能为空")
+
+            use_other_robot = bool(body.use_other_robot) if body.use_other_robot is not None else bool(row.get("use_other_robot"))
+            send_robot_pk: Optional[int]
+            if use_other_robot:
+                target_send_robot_id = (
+                    (body.send_robot_id or "").strip()
+                    if body.send_robot_id is not None
+                    else (
+                        _get_robot_by_pk_or_404(int(row["send_robot_pk"])).get("robot_id")
+                        if row.get("send_robot_pk")
+                        else ""
+                    )
+                )
+                if not target_send_robot_id:
+                    raise HTTPException(status_code=400, detail="已开启“使用其他机器人发送”，请先选择发送机器人")
+                send_robot = _require_robot_access(uid, target_send_robot_id)
+                send_robot_pk = int(send_robot["id"])
+            else:
+                send_robot_pk = None
+
+            prefix_enabled = bool(body.prefix_enabled) if body.prefix_enabled is not None else bool(row.get("prefix_enabled"))
+            prefix_template = (
+                body.prefix_template.strip()
+                if body.prefix_template is not None
+                else str(row.get("prefix_template") or "").strip()
+            ) or None
+            keyword_match_type = (
+                body.keyword_match_type if body.keyword_match_type is not None else row.get("keyword_match_type")
+            )
+            keyword_pattern = (
+                body.keyword_pattern.strip()
+                if body.keyword_pattern is not None
+                else str(row.get("keyword_pattern") or "").strip()
+            )
+            if keyword_match_type != "all" and not keyword_pattern:
+                raise HTTPException(status_code=400, detail="关键词匹配为精准/模糊时，请填写关键词")
+            enabled = bool(body.enabled) if body.enabled is not None else bool(row.get("enabled"))
+
+            cur.execute(
+                """
+                UPDATE forward_rules
+                SET source_robot_pk=%s,source_scene=%s,source_match_type=%s,source_pattern=%s,
+                    target_name=%s,use_other_robot=%s,send_robot_pk=%s,
+                    prefix_enabled=%s,prefix_template=%s,keyword_match_type=%s,keyword_pattern=%s,enabled=%s
+                WHERE id=%s AND created_by=%s
+                """,
+                (
+                    source_robot_pk,
+                    source_scene,
+                    source_match_type,
+                    source_pattern or None,
+                    target_name,
+                    1 if use_other_robot else 0,
+                    send_robot_pk,
+                    1 if prefix_enabled else 0,
+                    prefix_template,
+                    keyword_match_type,
+                    keyword_pattern or None,
+                    1 if enabled else 0,
+                    rule_id,
+                    uid,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.delete("/api/v1/forwards/{rule_id}")
+async def delete_forward_rule(rule_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM forward_rules WHERE id=%s AND created_by=%s", (rule_id, int(user["id"])))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.get("/api/v1/forwards/logs")
+async def list_forward_logs(
+    robot_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+    uid = int(user["id"])
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            where_parts = ["fr.created_by=%s"]
+            params: List[Any] = [uid]
+            if robot_id:
+                source_robot = _require_robot_access(uid, robot_id)
+                where_parts.append("fl.source_robot_pk=%s")
+                params.append(int(source_robot["id"]))
+            where_sql = " AND ".join(where_parts)
+            cur.execute(
+                f"""
+                SELECT COUNT(1) AS c
+                FROM forward_logs fl
+                JOIN forward_rules fr ON fr.id=fl.rule_id
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            offset = (page - 1) * page_size
+            cur.execute(
+                f"""
+                SELECT fl.*,sr.robot_id AS source_robot_id,rr.robot_id AS send_robot_id
+                FROM forward_logs fl
+                JOIN forward_rules fr ON fr.id=fl.rule_id
+                JOIN robots sr ON sr.id=fl.source_robot_pk
+                JOIN robots rr ON rr.id=fl.send_robot_pk
+                WHERE {where_sql}
+                ORDER BY fl.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params + [page_size, offset]),
+            )
+            rows = cur.fetchall() or []
+            items: List[Dict[str, Any]] = []
+            for row in rows:
+                items.append(
+                    {
+                        "id": int(row["id"]),
+                        "rule_id": int(row["rule_id"]),
+                        "source_robot_id": row.get("source_robot_id"),
+                        "send_robot_id": row.get("send_robot_id"),
+                        "source_scene": row.get("source_scene"),
+                        "source_name": row.get("source_name") or "",
+                        "sender_name": row.get("sender_name") or "",
+                        "target_name": row.get("target_name") or "",
+                        "message_id": row.get("message_id") or "",
+                        "question_text": row.get("question_text") or "",
+                        "forwarded_text": row.get("forwarded_text") or "",
+                        "status": row.get("status"),
+                        "error_reason": row.get("error_reason") or "",
+                        "time_cost": float(row.get("time_cost") or 0),
+                        "created_at": row.get("created_at"),
+                    }
+                )
+            return {"items": items, "total": total, "page": page, "page_size": page_size}
+    finally:
+        conn.close()
+
+
 # ----- compatible utility endpoints -----
 @app.get("/api/v1/logs/messages")
 async def list_message_logs(
@@ -2506,6 +3099,10 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
     )
 
     _insert_message_log(robot_pk, "inbound", scene, inbound_text, "received")
+    try:
+        await _run_forwarding_for_callback(robot, scene, req, inbound_text)
+    except Exception as e:
+        logger.warning("forwarding_pipeline_failed robot_id=%s err=%s", robot_id, str(e))
 
     if scene == "private" and not bool(robot.get("private_chat_enabled")):
         logger.info("qa_callback_skipped robot_id=%s reason=private_chat_disabled", robot_id)

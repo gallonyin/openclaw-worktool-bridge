@@ -93,6 +93,12 @@ export const api = {
   deleteRule: (id: number) => http.delete(`/rules/${id}`).then((r) => r.data),
   reorderRules: (robotId: string, scene: 'group' | 'private', ruleIds: number[]) =>
     http.put(`/robots/${robotId}/rules/reorder`, { rule_ids: ruleIds }, { params: { scene } }).then((r) => r.data),
+  listForwardRules: (params?: { source_robot_id?: string }) => http.get('/forwards', { params: params || {} }).then((r) => r.data.items),
+  createForwardRule: (payload: any) => http.post('/forwards', payload).then((r) => r.data),
+  updateForwardRule: (id: number, payload: any) => http.put(`/forwards/${id}`, payload).then((r) => r.data),
+  deleteForwardRule: (id: number) => http.delete(`/forwards/${id}`).then((r) => r.data),
+  listForwardLogs: (params: { robot_id?: string; page?: number; page_size?: number }) =>
+    http.get('/forwards/logs', { params }).then((r) => r.data),
   listMessageLogs: (params: any) => http.get('/logs/messages', { params }).then((r) => r.data),
   getMessageLog: (id: number) => http.get(`/logs/messages/${id}`).then((r) => r.data),
   getMessageMonitorLogs: (params: any) => http.get('/message-monitor/logs', { params }).then((r) => r.data),
