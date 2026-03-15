@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -263,6 +264,54 @@ def _sanitize_mysql_raw_confirm_rows(rows: List[Dict[str, Any]]) -> List[Dict[st
     ]
 
 
+def _extract_connect_log_fields(log_text: str) -> Dict[str, str]:
+    text = str(log_text or "")
+
+    def pick(pattern: str) -> str:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        return (m.group(1).strip() if m and m.group(1) else "")
+
+    app_version = pick(r"appVersion:\s*([^\s]+)")
+    work_version = pick(r"workVersion:\s*([^\s]+)")
+    device_rooted = pick(r"deviceRooted:\s*([^\s]+)")
+    hook = pick(r"hook:\s*([^\s]+)")
+    app_name = pick(r"appName:\s*(.*?)\s+blue:")
+    blue = pick(r"blue:\s*([^\s]+)")
+
+    android_version = ""
+    phone_model = ""
+    android_match = re.search(r"\bAndroid\s+([0-9][0-9A-Za-z\._-]*)\s+(.+?)\s+workVersion:", text, flags=re.IGNORECASE)
+    if android_match:
+        android_version = android_match.group(1).strip()
+        phone_model = android_match.group(2).strip()
+
+    return {
+        "App版本": app_version or "-",
+        "Android版本": android_version or "-",
+        "手机型号": phone_model or "-",
+        "WorkVersion": work_version or "-",
+        "设备Root": device_rooted or "-",
+        "Hook": hook or "-",
+        "App名称": app_name or "-",
+        "Blue": blue or "-",
+    }
+
+
+def _sanitize_robot_connect_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for x in rows:
+        parsed = _extract_connect_log_fields(str(x.get("log") or ""))
+        items.append(
+            {
+                "登录时间": x.get("create_time"),
+                "登录IP": x.get("ip") or "-",
+                **parsed,
+                "原始日志": (x.get("log") or "")[:300],
+            }
+        )
+    return items
+
+
 async def _fetch_worktool_api_loose(api_base: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{api_base.rstrip('/')}{path}"
     timeout = aiohttp.ClientTimeout(total=10)
@@ -507,6 +556,7 @@ async def run_troubleshoot_search(
                 "上线记录(最多20条)": [],
                 "raw_message_record 指令发送记录表": [],
                 "raw_msg_confirm 指令客户端执行结果表": [],
+                "robot_log 连接建立记录": [],
                 "问答回调记录": [],
                 "本地消息处理记录": [],
             },
@@ -562,6 +612,20 @@ async def run_troubleshoot_search(
         time_field="create_time",
         keyword_fields=["raw_msg", "error_reason", "success_list", "fail_list"],
     )
+    mysql_robot_log_rows = _mysql_table_query(
+        table="robot_log",
+        robot_id=robot_id,
+        message_id="",
+        keyword=keyword,
+        start_time=start_time,
+        end_time=end_time,
+        limit=limit,
+        robot_field="robot_id",
+        message_field=None,
+        time_field="create_time",
+        keyword_fields=["log", "ip"],
+    )
+    mysql_robot_log_rows = [x for x in mysql_robot_log_rows if "连接建立" in str(x.get("log") or "")]
     raw_message_rows = (
         _sanitize_mysql_raw_message_rows(mysql_raw_message_rows)
         if mysql_raw_message_rows
@@ -623,6 +687,7 @@ async def run_troubleshoot_search(
             ],
             "raw_message_record 指令发送记录表": raw_message_rows,
             "raw_msg_confirm 指令客户端执行结果表": raw_confirm_rows,
+            "robot_log 连接建立记录": _sanitize_robot_connect_rows(mysql_robot_log_rows),
             "问答回调记录": _sanitize_qa_rows(qa_rows, message_id, limit),
             "本地消息处理记录": [
                 {

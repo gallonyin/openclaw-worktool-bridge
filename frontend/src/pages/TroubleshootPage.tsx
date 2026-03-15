@@ -43,6 +43,7 @@ export default function TroubleshootPage() {
   const qaRows = useMemo(() => result?.sections?.['问答回调记录'] || [], [result]);
   const rawMessageRows = useMemo(() => result?.sections?.['raw_message_record 指令发送记录表'] || [], [result]);
   const rawConfirmRows = useMemo(() => result?.sections?.['raw_msg_confirm 指令客户端执行结果表'] || [], [result]);
+  const connectRows = useMemo(() => result?.sections?.['robot_log 连接建立记录'] || [], [result]);
   const callbackRows = useMemo(() => result?.sections?.['回调配置'] || [], [result]);
   const onlineRows = useMemo(() => result?.sections?.['上线记录(最多20条)'] || [], [result]);
   const localLogRows = useMemo(() => result?.sections?.['本地消息处理记录'] || [], [result]);
@@ -175,6 +176,30 @@ export default function TroubleshootPage() {
               { title: '执行结果', dataIndex: '执行结果', width: 100 },
               { title: '执行耗时(秒)', dataIndex: '执行耗时(秒)', width: 120 },
               { title: '失败原因', dataIndex: '失败原因', ellipsis: true }
+            ]}
+          />
+        </Card>
+      ) : null}
+
+      {result ? (
+        <Card title={`robot_log 连接建立记录 (${connectRows.length})`}>
+          <Table
+            rowKey={(_, idx) => String(idx)}
+            dataSource={connectRows}
+            pagination={false}
+            scroll={{ x: 1600 }}
+            columns={[
+              { title: '登录时间', dataIndex: '登录时间', width: 180 },
+              { title: '登录IP', dataIndex: '登录IP', width: 140 },
+              { title: 'App版本', dataIndex: 'App版本', width: 120 },
+              { title: 'Android版本', dataIndex: 'Android版本', width: 120 },
+              { title: '手机型号', dataIndex: '手机型号', width: 220, ellipsis: true },
+              { title: 'WorkVersion', dataIndex: 'WorkVersion', width: 120 },
+              { title: '设备Root', dataIndex: '设备Root', width: 90 },
+              { title: 'Hook', dataIndex: 'Hook', width: 90 },
+              { title: 'App名称', dataIndex: 'App名称', width: 140 },
+              { title: 'Blue', dataIndex: 'Blue', width: 80 },
+              { title: '原始日志', dataIndex: '原始日志', ellipsis: true }
             ]}
           />
         </Card>
