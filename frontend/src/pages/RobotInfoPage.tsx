@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Button, Card, Col, Input, Modal, Popover, Row, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Button, Card, Col, Input, Modal, Popover, Row, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { QuestionCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
 import type { Robot } from '../types';
@@ -48,6 +48,12 @@ function isNotExpired(val?: string) {
   const d = new Date(val);
   if (Number.isNaN(d.getTime())) return false;
   return d.getTime() > Date.now();
+}
+
+function isSameDay(ts: number, nowTs: number) {
+  const d1 = new Date(ts);
+  const d2 = new Date(nowTs);
+  return d1.getFullYear() === d2.getFullYear() && d1.getMonth() === d2.getMonth() && d1.getDate() === d2.getDate();
 }
 
 export default function RobotInfoPage() {
@@ -169,6 +175,16 @@ export default function RobotInfoPage() {
     (a, b) => parseLooseDateTime(b?.onlineTime) - parseLooseDateTime(a?.onlineTime)
   )[0];
   const lastLoginIp = latestOnlineInfo?.ip || detail?.ip || detail?.lastLoginIp || '-';
+  const loginFlapStats = useMemo(() => {
+    const now = Date.now();
+    const dayStartCount = onlineInfos.filter((row: any) => isSameDay(parseLooseDateTime(row?.onlineTime), now)).length;
+    const recent24hCount = onlineInfos.filter((row: any) => {
+      const t = parseLooseDateTime(row?.onlineTime);
+      return t > 0 && now - t <= 24 * 60 * 60 * 1000;
+    }).length;
+    const shouldWarn = dayStartCount > 10 || recent24hCount > 10;
+    return { dayStartCount, recent24hCount, shouldWarn };
+  }, [onlineInfos]);
 
   const ensureCallbackInput = () => {
     if (!selectedRobotId) {
@@ -421,6 +437,15 @@ export default function RobotInfoPage() {
         </Col>
         <Col xs={24} lg={12}>
           <Card title="机器人登录日志" extra={<Typography.Link>查看更多</Typography.Link>}>
+            {loginFlapStats.shouldWarn ? (
+              <Alert
+                style={{ marginBottom: 12 }}
+                type="warning"
+                showIcon
+                message={`登录上下线波动偏高：24小时 ${loginFlapStats.recent24hCount} 次，今日 ${loginFlapStats.dayStartCount} 次`}
+                description="检测到登录日志频繁波动，可能是客户端设备网络状况不佳，建议优先检查设备网络稳定性。"
+              />
+            ) : null}
             <Table
               rowKey={(r: any, idx) => `${r.robotId || 'r'}-${r.onlineTime || ''}-${idx}`}
               dataSource={onlineInfos}
