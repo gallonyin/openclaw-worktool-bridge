@@ -4,6 +4,8 @@ export interface Robot {
   private_chat_enabled: boolean;
   group_chat_enabled: boolean;
   group_reply_only_when_mentioned: boolean;
+  group_reply_mode?: 'always' | 'mention_only' | 'ai_decide';
+  group_decision_provider_id?: number | null;
   created_at: string;
   updated_at: string;
 }

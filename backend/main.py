@@ -171,6 +171,8 @@ def init_db() -> None:
                   private_chat_enabled TINYINT(1) NOT NULL DEFAULT 1,
                   group_chat_enabled TINYINT(1) NOT NULL DEFAULT 1,
                   group_reply_only_when_mentioned TINYINT(1) NOT NULL DEFAULT 0,
+                  group_reply_mode ENUM('always','mention_only','ai_decide') NOT NULL DEFAULT 'always',
+                  group_decision_provider_id BIGINT NULL,
                   version INT NOT NULL DEFAULT 0,
                   created_by BIGINT NOT NULL,
                   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -324,6 +326,23 @@ def init_db() -> None:
             cur.execute("SHOW COLUMNS FROM routing_rules LIKE 'content_pattern'")
             if not cur.fetchone():
                 cur.execute("ALTER TABLE routing_rules ADD COLUMN content_pattern VARCHAR(1024) NULL AFTER pattern")
+            cur.execute("SHOW COLUMNS FROM robots LIKE 'group_reply_mode'")
+            if not cur.fetchone():
+                cur.execute(
+                    "ALTER TABLE robots ADD COLUMN group_reply_mode ENUM('always','mention_only','ai_decide') NOT NULL DEFAULT 'always' AFTER group_reply_only_when_mentioned"
+                )
+                cur.execute(
+                    """
+                    UPDATE robots
+                    SET group_reply_mode=CASE
+                      WHEN group_reply_only_when_mentioned=1 THEN 'mention_only'
+                      ELSE 'always'
+                    END
+                    """
+                )
+            cur.execute("SHOW COLUMNS FROM robots LIKE 'group_decision_provider_id'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE robots ADD COLUMN group_decision_provider_id BIGINT NULL AFTER group_reply_mode")
             cur.execute("SHOW COLUMNS FROM routing_rules LIKE 'pattern_match_type'")
             if not cur.fetchone():
                 cur.execute(
@@ -801,6 +820,8 @@ class RobotCreate(BaseModel):
     private_chat_enabled: bool = True
     group_chat_enabled: bool = True
     group_reply_only_when_mentioned: bool = False
+    group_reply_mode: Literal["always", "mention_only", "ai_decide"] = "always"
+    group_decision_provider_id: Optional[int] = None
     group_default_reply: Optional[str] = None
     private_default_reply: Optional[str] = None
 
@@ -810,6 +831,8 @@ class RobotUpdate(BaseModel):
     private_chat_enabled: Optional[bool] = None
     group_chat_enabled: Optional[bool] = None
     group_reply_only_when_mentioned: Optional[bool] = None
+    group_reply_mode: Optional[Literal["always", "mention_only", "ai_decide"]] = None
+    group_decision_provider_id: Optional[int] = None
     group_default_reply: Optional[str] = None
     private_default_reply: Optional[str] = None
 
@@ -1027,6 +1050,16 @@ def _resolve_auth_scheme(provider_type: str, auth_scheme: Optional[str]) -> str:
     if auth_scheme:
         return auth_scheme
     return "x-openclaw-token" if provider_type == "openclaw" else "bearer"
+
+
+def _normalize_group_reply_mode(
+    group_reply_mode: Optional[str],
+    group_reply_only_when_mentioned: Optional[bool],
+) -> str:
+    mode = (group_reply_mode or "").strip().lower()
+    if mode in {"always", "mention_only", "ai_decide"}:
+        return mode
+    return "mention_only" if bool(group_reply_only_when_mentioned) else "always"
 
 
 def _normalize_extra_json(extra_json: Optional[str]) -> Optional[str]:
@@ -1669,6 +1702,115 @@ def _load_default_reply(robot_pk: int, scene: str) -> str:
         conn.close()
 
 
+def _load_provider_for_decision(provider_id: int) -> Optional[Dict[str, Any]]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ai_providers WHERE id=%s AND enabled=1 LIMIT 1", (int(provider_id),))
+            row = cur.fetchone()
+            return row if isinstance(row, dict) else None
+    finally:
+        conn.close()
+
+
+def _load_group_recent_context(robot_pk: int, group_name: str, limit: int = 8) -> List[Dict[str, Any]]:
+    g = (group_name or "").strip()
+    if not g:
+        return []
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT received_name,question,answer,created_at
+                FROM qa_monitor_logs
+                WHERE robot_pk=%s AND room_type IN (1,3) AND COALESCE(group_name,'')=%s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (int(robot_pk), g, max(int(limit), 1)),
+            )
+            rows = cur.fetchall() or []
+            rows.reverse()
+            return rows
+    finally:
+        conn.close()
+
+
+async def _should_reply_group_by_ai_decision(
+    robot: Dict[str, Any],
+    req: QARequest,
+    inbound_text: str,
+) -> bool:
+    provider_id = robot.get("group_decision_provider_id")
+    if provider_id is None:
+        logger.warning("group_ai_decide_skipped robot_id=%s reason=missing_provider_id", robot.get("robot_id"))
+        return False
+    provider = _load_provider_for_decision(int(provider_id))
+    if not provider:
+        logger.warning(
+            "group_ai_decide_skipped robot_id=%s provider_id=%s reason=provider_not_found_or_disabled",
+            robot.get("robot_id"),
+            provider_id,
+        )
+        return False
+
+    history_rows = _load_group_recent_context(int(robot["id"]), (req.groupName or "").strip(), 8)
+    history_lines: List[str] = []
+    for row in history_rows:
+        sender = (row.get("received_name") or "").strip() or "未知用户"
+        question = (row.get("question") or "").strip()
+        answer = (row.get("answer") or "").strip()
+        if question:
+            history_lines.append(f"用户[{sender}]：{question}")
+        if answer:
+            history_lines.append(f"AI：{answer}")
+    history_text = "\n".join(history_lines[-12:]) or "（无）"
+    current_sender = (req.receivedName or "").strip() or "未知用户"
+    prompt = (
+        "你是群聊回复门控器。请判断最后一条消息是否应由机器人在群聊公开回复。\n"
+        "规则：如果最后一条明显是在问机器人问题、寻求机器人能力、@机器人上下文延续，则返回 YES；\n"
+        "如果更像成员间闲聊、互相对话、与机器人无关，则返回 NO。\n"
+        "只允许输出 YES 或 NO，不要输出其他任何文字。\n\n"
+        f"群名：{(req.groupName or '').strip()}\n"
+        f"发送者：{current_sender}\n"
+        f"最后一条消息：{(inbound_text or '').strip()}\n"
+        f"近期上下文：\n{history_text}\n"
+    )
+    decision_rule = {
+        "id": -1,
+        "provider_id": int(provider["id"]),
+        "provider_name": provider.get("name") or "group_decision_provider",
+        "base_url": provider.get("base_url") or "",
+        "api_token": provider.get("api_token") or "",
+        "model": provider.get("model") or "",
+        "provider_type": provider.get("provider_type") or "openai",
+        "auth_scheme": provider.get("auth_scheme") or "bearer",
+        "extra_json": provider.get("extra_json"),
+    }
+    try:
+        text = await _call_provider(decision_rule, prompt)
+    except Exception as e:
+        logger.warning(
+            "group_ai_decide_failed robot_id=%s provider_id=%s err=%s",
+            robot.get("robot_id"),
+            provider_id,
+            str(e),
+        )
+        return False
+    token = (text or "").strip().upper()
+    decision = token.startswith("YES") or token.startswith("A")
+    logger.info(
+        "group_ai_decide_result robot_id=%s provider_id=%s sender=%s decision=%s raw=%s",
+        robot.get("robot_id"),
+        provider_id,
+        current_sender,
+        decision,
+        _short_text(token, 24),
+    )
+    return decision
+
+
 def _load_enabled_rules(robot_pk: int, scene: str) -> List[Dict[str, Any]]:
     conn = db_conn()
     try:
@@ -2235,6 +2377,10 @@ async def list_robots(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[
                 row["private_chat_enabled"] = bool(row["private_chat_enabled"])
                 row["group_chat_enabled"] = bool(row["group_chat_enabled"])
                 row["group_reply_only_when_mentioned"] = bool(row["group_reply_only_when_mentioned"])
+                row["group_reply_mode"] = str(row.get("group_reply_mode") or _normalize_group_reply_mode(None, row["group_reply_only_when_mentioned"]))
+                row["group_decision_provider_id"] = (
+                    int(row["group_decision_provider_id"]) if row.get("group_decision_provider_id") is not None else None
+                )
                 items.append(row)
             return {"items": items}
     finally:
@@ -2254,6 +2400,10 @@ async def get_robot(robot_id: str, user: Dict[str, Any] = Depends(get_current_us
     row["private_chat_enabled"] = bool(row["private_chat_enabled"])
     row["group_chat_enabled"] = bool(row["group_chat_enabled"])
     row["group_reply_only_when_mentioned"] = bool(row["group_reply_only_when_mentioned"])
+    row["group_reply_mode"] = str(row.get("group_reply_mode") or _normalize_group_reply_mode(None, row["group_reply_only_when_mentioned"]))
+    row["group_decision_provider_id"] = (
+        int(row["group_decision_provider_id"]) if row.get("group_decision_provider_id") is not None else None
+    )
     row["defaults"] = {x["scene"]: x["reply_text"] for x in defaults}
     return row
 
@@ -2263,6 +2413,12 @@ async def create_robot(body: RobotCreate, user: Dict[str, Any] = Depends(get_cur
     rid = (body.robot_id or "").strip()
     if not rid:
         raise HTTPException(status_code=400, detail="robot_id required")
+    group_reply_mode = _normalize_group_reply_mode(body.group_reply_mode, body.group_reply_only_when_mentioned)
+    decision_provider_id = body.group_decision_provider_id
+    if group_reply_mode == "ai_decide" and decision_provider_id is None:
+        raise HTTPException(status_code=400, detail="group_decision_provider_id required when group_reply_mode=ai_decide")
+    if decision_provider_id is not None and not _provider_accessible_by_user(int(decision_provider_id), int(user["id"])):
+        raise HTTPException(status_code=400, detail="group_decision_provider_id not accessible")
 
     auto_bind = parse_bool(get_setting("auto_bind_message_callback_on_create", "true"), True)
     callback_url = build_robot_callback_url(rid)
@@ -2282,15 +2438,20 @@ async def create_robot(body: RobotCreate, user: Dict[str, Any] = Depends(get_cur
             else:
                 cur.execute(
                     """
-                    INSERT INTO robots(robot_id,name,private_chat_enabled,group_chat_enabled,group_reply_only_when_mentioned,created_by)
-                    VALUES(%s,%s,%s,%s,%s,%s)
+                    INSERT INTO robots(
+                      robot_id,name,private_chat_enabled,group_chat_enabled,group_reply_only_when_mentioned,
+                      group_reply_mode,group_decision_provider_id,created_by
+                    )
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         rid,
                         (body.name or "机器人").strip() or "机器人",
                         1 if body.private_chat_enabled else 0,
                         1 if body.group_chat_enabled else 0,
-                        1 if body.group_reply_only_when_mentioned else 0,
+                        1 if group_reply_mode == "mention_only" else 0,
+                        group_reply_mode,
+                        int(decision_provider_id) if decision_provider_id is not None else None,
                         int(user["id"]),
                     ),
                 )
@@ -2335,9 +2496,32 @@ async def update_robot(robot_id: str, body: RobotUpdate, user: Dict[str, Any] = 
     if body.group_chat_enabled is not None:
         updates.append("group_chat_enabled=%s")
         params.append(1 if body.group_chat_enabled else 0)
-    if body.group_reply_only_when_mentioned is not None:
+    has_group_reply_mode = "group_reply_mode" in body.model_fields_set
+    has_group_reply_only_when_mentioned = "group_reply_only_when_mentioned" in body.model_fields_set
+    has_group_decision_provider_id = "group_decision_provider_id" in body.model_fields_set
+
+    resolved_group_reply_mode: Optional[str] = None
+    if has_group_reply_mode or has_group_reply_only_when_mentioned:
+        resolved_group_reply_mode = _normalize_group_reply_mode(body.group_reply_mode, body.group_reply_only_when_mentioned)
+        updates.append("group_reply_mode=%s")
+        params.append(resolved_group_reply_mode)
         updates.append("group_reply_only_when_mentioned=%s")
-        params.append(1 if body.group_reply_only_when_mentioned else 0)
+        params.append(1 if resolved_group_reply_mode == "mention_only" else 0)
+
+    if has_group_decision_provider_id:
+        if body.group_decision_provider_id is not None and not _provider_accessible_by_user(
+            int(body.group_decision_provider_id), int(user["id"])
+        ):
+            raise HTTPException(status_code=400, detail="group_decision_provider_id not accessible")
+        updates.append("group_decision_provider_id=%s")
+        params.append(int(body.group_decision_provider_id) if body.group_decision_provider_id is not None else None)
+
+    if resolved_group_reply_mode == "ai_decide":
+        current_provider_id = (
+            int(body.group_decision_provider_id) if has_group_decision_provider_id and body.group_decision_provider_id is not None else robot.get("group_decision_provider_id")
+        )
+        if current_provider_id is None:
+            raise HTTPException(status_code=400, detail="group_decision_provider_id required when group_reply_mode=ai_decide")
 
     conn = db_conn()
     try:
@@ -3245,11 +3429,23 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
             _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
             _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at)
             return QAResponse(code=0, message="参数接收成功")
-        if bool(robot.get("group_reply_only_when_mentioned")) and not bool(req.atMe):
-            logger.info("qa_callback_skipped robot_id=%s reason=group_only_when_mentioned", robot_id)
-            _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
-            _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at)
-            return QAResponse(code=0, message="参数接收成功")
+        group_reply_mode = _normalize_group_reply_mode(
+            str(robot.get("group_reply_mode") or ""),
+            bool(robot.get("group_reply_only_when_mentioned")),
+        )
+        if not bool(req.atMe):
+            if group_reply_mode == "mention_only":
+                logger.info("qa_callback_skipped robot_id=%s reason=group_only_when_mentioned", robot_id)
+                _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
+                _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at)
+                return QAResponse(code=0, message="参数接收成功")
+            if group_reply_mode == "ai_decide":
+                should_reply = await _should_reply_group_by_ai_decision(robot, req, inbound_text)
+                if not should_reply:
+                    logger.info("qa_callback_skipped robot_id=%s reason=group_ai_decide_no", robot_id)
+                    _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
+                    _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at)
+                    return QAResponse(code=0, message="参数接收成功")
 
     selected_rule: Optional[Dict[str, Any]] = None
     selected_rank: Optional[int] = None

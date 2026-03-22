@@ -166,7 +166,9 @@ export default function RobotPage() {
       private_default_reply: '收到',
       private_chat_enabled: true,
       group_chat_enabled: true,
-      group_reply_only_when_mentioned: false
+      group_reply_only_when_mentioned: false,
+      group_reply_mode: 'always',
+      group_decision_provider_id: undefined
     });
     setRobotOpen(true);
   };
@@ -175,6 +177,7 @@ export default function RobotPage() {
     try {
       const res = await api.getRobot(robotId);
       setEditingRobotId(robotId);
+      const groupReplyMode = res?.group_reply_mode || (res?.group_reply_only_when_mentioned ? 'mention_only' : 'always');
       robotForm.resetFields();
       robotForm.setFieldsValue({
         robot_id: robotId,
@@ -183,7 +186,9 @@ export default function RobotPage() {
         private_default_reply: res?.defaults?.private || '',
         group_chat_enabled: res?.group_chat_enabled !== false,
         private_chat_enabled: res?.private_chat_enabled !== false,
-        group_reply_only_when_mentioned: !!res?.group_reply_only_when_mentioned
+        group_reply_only_when_mentioned: !!res?.group_reply_only_when_mentioned,
+        group_reply_mode: groupReplyMode,
+        group_decision_provider_id: res?.group_decision_provider_id ?? undefined
       });
       setRobotOpen(true);
     } catch (e: any) {
@@ -206,6 +211,9 @@ export default function RobotPage() {
 
   const submitRobot = async () => {
     const values = await robotForm.validateFields();
+    if (values.group_reply_mode !== 'ai_decide') {
+      values.group_decision_provider_id = null;
+    }
     try {
       if (editingRobotId) {
         await api.updateRobot(editingRobotId, values);
@@ -529,10 +537,59 @@ export default function RobotPage() {
             <Form.Item name="private_chat_enabled" valuePropName="checked" label="私聊开关">
               <Switch />
             </Form.Item>
-            <Form.Item name="group_reply_only_when_mentioned" valuePropName="checked" label="仅@回复">
-              <Switch />
-            </Form.Item>
           </Space>
+          <Form.Item
+            name="group_reply_mode"
+            label={helpLabel(
+              '群聊回复策略',
+              <Space direction="vertical" size={4}>
+                <div>始终回复：@和非@机器人全部根据规则回复。</div>
+                <div>仅@回复：@机器人且命中规则时回复。</div>
+                <div>AI判断是否需要回复：群里未@时，先由AI判定是否需要机器人回复。</div>
+              </Space>
+            )}
+            rules={[{ required: true, message: '请选择群聊回复策略' }]}
+          >
+            <Select
+              options={[
+                { label: '始终回复', value: 'always' },
+                { label: '仅@回复', value: 'mention_only' },
+                { label: 'AI判断是否需要回复', value: 'ai_decide' }
+              ]}
+            />
+          </Form.Item>
+          <Form.Item
+            noStyle
+            shouldUpdate={(prev, next) => prev.group_reply_mode !== next.group_reply_mode}
+          >
+            {({ getFieldValue }) => {
+              const mode = getFieldValue('group_reply_mode');
+              if (mode !== 'ai_decide') return null;
+              return (
+                <Form.Item
+                  name="group_decision_provider_id"
+                  label={helpLabel(
+                    '群聊判定引擎',
+                    <Space direction="vertical" size={4}>
+                      <div>用途：仅用于判断“这条群消息要不要回复”。</div>
+                      <div>建议：选择一个低成本、低延迟的模型。</div>
+                    </Space>
+                  )}
+                  rules={[{ required: true, message: '请选择群聊判定引擎' }]}
+                >
+                  <Select
+                    options={providerOptions}
+                    placeholder="选择AI回复引擎（可在“AI回复引擎”页面先创建）"
+                    showSearch
+                    optionFilterProp="label"
+                  />
+                </Form.Item>
+              );
+            }}
+          </Form.Item>
+          <Form.Item name="group_reply_only_when_mentioned" valuePropName="checked" hidden initialValue={false}>
+            <Switch />
+          </Form.Item>
         </Form>
       </Modal>
 
