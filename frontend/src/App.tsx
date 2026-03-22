@@ -6,6 +6,7 @@ import {
   RobotOutlined,
   FileTextOutlined,
   ApiOutlined,
+  ProfileOutlined,
   InfoCircleOutlined,
   SearchOutlined,
   ShareAltOutlined,
@@ -18,6 +19,7 @@ import AIHubPage from './pages/AIHubPage';
 import ForwardPage from './pages/ForwardPage';
 import RobotInfoPage from './pages/RobotInfoPage';
 import TroubleshootPage from './pages/TroubleshootPage';
+import CommandTaskPage from './pages/CommandTaskPage';
 import LoginPage from './pages/LoginPage';
 import UserManagementPage from './pages/UserManagementPage';
 import { api, clearAccessToken, getAccessToken } from './api';
@@ -123,6 +125,7 @@ export default function App() {
       { key: '/robot-info', icon: <InfoCircleOutlined />, label: <Link to="/robot-info">机器人信息</Link> },
       { key: '/robots', icon: <RobotOutlined />, label: <Link to="/robots">机器人配置</Link> },
       { key: '/logs', icon: <FileTextOutlined />, label: <Link to="/logs">消息监控</Link> },
+      { key: '/command-tasks', icon: <ProfileOutlined />, label: <Link to="/command-tasks">指令任务查询</Link> },
       { key: '/forward', icon: <ShareAltOutlined />, label: <Link to="/forward">消息转发</Link> },
       { key: '/providers', icon: <ApiOutlined />, label: <Link to="/providers">AI回复引擎</Link> }
     ];
@@ -199,6 +202,7 @@ export default function App() {
             <Route path="/robot-info" element={<RobotInfoPage />} />
             <Route path="/robots" element={<RobotPage />} />
             <Route path="/logs" element={<MessageLogPage />} />
+            <Route path="/command-tasks" element={<CommandTaskPage />} />
             <Route path="/forward" element={<ForwardPage />} />
             <Route path="/providers" element={<AIHubPage />} />
             {enableTroubleshoot && isAdmin ? <Route path="/troubleshoot" element={<TroubleshootPage />} /> : <Route path="/troubleshoot" element={<Navigate to="/dashboard" replace />} />}

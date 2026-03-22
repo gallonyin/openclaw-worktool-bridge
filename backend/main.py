@@ -3358,6 +3358,40 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
         return QAResponse(code=0, message="参数接收成功")
 
 
+
+
+@app.get("/api/v1/worktool/raw-commands")
+async def get_worktool_raw_commands(
+    robot_id: str,
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=200),
+    sort: str = "create_time,desc",
+    message_id: str = "",
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    params: Dict[str, Any] = {"robotId": robot_id, "page": page, "size": size, "sort": sort}
+    mid = (message_id or "").strip()
+    if mid:
+        params["messageId"] = mid
+    return await fetch_worktool_api("/wework/listRawMessage", params)
+
+
+@app.get("/api/v1/worktool/raw-command-results")
+async def get_worktool_raw_command_results(
+    robot_id: str,
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=100, ge=1, le=200),
+    sort: str = "run_time,desc",
+    message_id: str = "",
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    params: Dict[str, Any] = {"robotId": robot_id, "page": page, "size": size, "sort": sort}
+    mid = (message_id or "").strip()
+    if mid:
+        params["messageId"] = mid
+    return await fetch_worktool_api("/robot/rawMsg/list", params)
 @app.get("/api/v1/worktool/qa-logs")
 async def get_worktool_qa_logs(
     robot_id: str,

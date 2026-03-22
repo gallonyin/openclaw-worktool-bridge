@@ -103,6 +103,10 @@ export const api = {
   getMessageLog: (id: number) => http.get(`/logs/messages/${id}`).then((r) => r.data),
   getMessageMonitorLogs: (params: any) => http.get('/message-monitor/logs', { params }).then((r) => r.data),
   getWorktoolQaLogs: (params: any) => http.get('/worktool/qa-logs', { params }).then((r) => r.data),
+  getWorktoolRawCommands: (params: { robot_id: string; page?: number; size?: number; sort?: string; message_id?: string }) =>
+    http.get('/worktool/raw-commands', { params }).then((r) => r.data),
+  getWorktoolRawCommandResults: (params: { robot_id: string; page?: number; size?: number; sort?: string; message_id?: string }) =>
+    http.get('/worktool/raw-command-results', { params }).then((r) => r.data),
   getRobotInfoDetail: (robotId: string) => http.get('/robot-info/detail', { params: { robot_id: robotId } }).then((r) => r.data),
   getRobotInfoCallbacks: (robotId: string) => http.get('/robot-info/callbacks', { params: { robot_id: robotId } }).then((r) => r.data),
   getRobotInfoOnline: (robotId: string) => http.get('/robot-info/online', { params: { robot_id: robotId } }).then((r) => r.data),
