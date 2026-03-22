@@ -1065,12 +1065,27 @@ def build_robot_callback_url(robot_id: str) -> str:
 
 async def fetch_worktool_api(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{get_worktool_api_base()}{path}"
+    # aiohttp query params do not accept None values.
+    safe_params = {k: v for k, v in (params or {}).items() if v is not None}
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, params=params) as resp:
-            data = await resp.json(content_type=None)
+        async with session.get(url, params=safe_params) as resp:
             if resp.status != 200:
                 raise HTTPException(status_code=502, detail=f"worktool request failed: status={resp.status}")
+            raw = await resp.text()
+            if not raw.strip():
+                raise HTTPException(status_code=502, detail="worktool response empty")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                preview = raw.strip().replace("\\n", " ")[:200]
+                logger.warning(
+                    "worktool non-json response path=%s status=%s body_preview=%s",
+                    path,
+                    resp.status,
+                    preview,
+                )
+                raise HTTPException(status_code=502, detail="worktool response is not valid json")
             return data if isinstance(data, dict) else {"data": data}
 
 
