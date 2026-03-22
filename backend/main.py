@@ -1078,7 +1078,7 @@ async def fetch_worktool_api(path: str, params: Dict[str, Any]) -> Dict[str, Any
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                preview = raw.strip().replace("\\n", " ")[:200]
+                preview = raw.strip().replace("\n", " ")[:200]
                 logger.warning(
                     "worktool non-json response path=%s status=%s body_preview=%s",
                     path,
@@ -1544,6 +1544,92 @@ def _insert_qa_monitor_log(robot_pk: int, req: QARequest, question: str, callbac
         except Exception:
             pass
         return 0
+    finally:
+        conn.close()
+
+
+def _is_duplicate_qa_callback(robot_pk: int, req: QARequest, question: str, window_seconds: int = 8) -> bool:
+    room_type = int(req.roomType or 0)
+    text_type = int(req.textType or 1)
+    received_name = (req.receivedName or "").strip()
+    group_name = (req.groupName or "").strip()
+    message_id = _pick_message_id(req)
+    question = (question or "").strip()
+    if not question:
+        return False
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Priority 1: strong de-dup by message_id when available.
+            if message_id:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM qa_monitor_logs
+                    WHERE robot_pk=%s
+                      AND COALESCE(message_id,'')=%s
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL 120 SECOND)
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (int(robot_pk), message_id),
+                )
+                if cur.fetchone():
+                    return True
+
+                # Some callbacks arrive first without message_id then with message_id seconds later.
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM qa_monitor_logs
+                    WHERE robot_pk=%s
+                      AND room_type=%s
+                      AND COALESCE(received_name,'')=%s
+                      AND COALESCE(group_name,'')=%s
+                      AND question=%s
+                      AND COALESCE(message_id,'')=''
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL %s SECOND)
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (
+                        int(robot_pk),
+                        room_type,
+                        received_name,
+                        group_name,
+                        question,
+                        max(int(window_seconds), 1),
+                    ),
+                )
+                if cur.fetchone():
+                    return True
+
+            params: List[Any] = [
+                int(robot_pk),
+                room_type,
+                text_type,
+                received_name,
+                group_name,
+                question,
+                max(int(window_seconds), 1),
+            ]
+            sql = (
+                """
+                SELECT id
+                FROM qa_monitor_logs
+                WHERE robot_pk=%s
+                  AND room_type=%s
+                  AND text_type=%s
+                  AND COALESCE(received_name,'')=%s
+                  AND COALESCE(group_name,'')=%s
+                  AND question=%s
+                  AND created_at >= DATE_SUB(NOW(), INTERVAL %s SECOND)
+                """
+            )
+            sql += " ORDER BY id DESC LIMIT 1"
+            cur.execute(sql, tuple(params))
+            return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("qa_callback_duplicate_check_failed robot_pk=%s err=%s", robot_pk, str(e))
+        return False
     finally:
         conn.close()
 
@@ -3101,14 +3187,43 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
     scene = _scene_from_room_type(req.roomType)
     inbound_text = _pick_inbound_text(req)
     match_target = _rule_match_target(scene, req)
+    callback_message_id = _pick_message_id(req)
+
+    # Only text callbacks should trigger QA reply pipeline.
+    if int(req.textType or 0) != 1:
+        logger.info(
+            "qa_callback_non_text_ignored robot_id=%s robot_pk=%s scene=%s room_type=%s text_type=%s message_id=%s",
+            robot_id,
+            robot_pk,
+            scene,
+            req.roomType,
+            req.textType,
+            callback_message_id or "-",
+        )
+        return QAResponse(code=0, message="参数接收成功")
+
+    if _is_duplicate_qa_callback(robot_pk, req, inbound_text):
+        logger.info(
+            "qa_callback_duplicate_ignored robot_id=%s robot_pk=%s scene=%s room_type=%s message_id=%s match_target=%s text=%s",
+            robot_id,
+            robot_pk,
+            scene,
+            req.roomType,
+            callback_message_id or "-",
+            _short_text(match_target, 120),
+            _short_text(inbound_text, 200),
+        )
+        return QAResponse(code=0, message="参数接收成功")
+
     local_log_id = _insert_qa_monitor_log(robot_pk, req, inbound_text, str(request.url))
     logger.info(
-        "qa_callback_received robot_id=%s robot_pk=%s scene=%s room_type=%s at_me=%s match_target=%s text=%s",
+        "qa_callback_received robot_id=%s robot_pk=%s scene=%s room_type=%s at_me=%s message_id=%s match_target=%s text=%s",
         robot_id,
         robot_pk,
         scene,
         req.roomType,
         req.atMe,
+        callback_message_id or "-",
         _short_text(match_target, 120),
         _short_text(inbound_text, 200),
     )
