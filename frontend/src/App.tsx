@@ -167,6 +167,12 @@ export default function App() {
               机器人管理系统
             </Typography.Title>
             <Space>
+              <Button href="/docs/" target="_blank" rel="noreferrer">
+                使用文档
+              </Button>
+              <Button href="https://worktool.apifox.cn/" target="_blank" rel="noreferrer">
+                API文档
+              </Button>
               <Button href="https://github.com/answerlink/openclaw-worktool-bridge" target="_blank" rel="noreferrer">
                 开源地址
               </Button>

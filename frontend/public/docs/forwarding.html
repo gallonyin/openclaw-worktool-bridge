@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>消息转发 - WorkTool Bridge 文档</title>
+  <meta name="description" content="转发规则与日志排查" />
+  <link rel="canonical" href="/docs/forwarding.html" />
+  <link rel="stylesheet" href="/docs/assets/docs.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
+      <div id="search-results" class="search-results"></div>
+      <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item" href="/docs/quickstart.html">快速开始</a><a class="nav-item" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item active" href="/docs/forwarding.html">消息转发</a><a class="nav-item" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item" href="/docs/faq.html">常见问题</a></nav>
+    </aside>
+    <main class="main">
+      <article class="doc">
+        <h1 id="消息转发">消息转发</h1><h2 id="功能范围">功能范围</h2><p>当前版本仅支持文本消息转发。</p>
+<h2 id="规则结构">规则结构</h2><ul>
+<li>来源机器人：由页面顶部选择</li>
+<li>来源场景：群聊 / 私聊</li>
+<li>来源对象匹配：全部 / 精准 / 模糊</li>
+<li>目标群名/昵称/备注名：转发目标</li>
+<li>发送机器人：默认来源机器人，也可指定 B 机器人</li>
+<li>关键词过滤：控制哪些消息需要转发</li>
+<li>前缀：可开关，关闭后可原文转发</li>
+</ul>
+<h2 id="典型场景">典型场景</h2><ul>
+<li>把 A 群关键消息转发到运营群</li>
+<li>把私聊咨询转发给人工账号</li>
+</ul>
+<h2 id="排错">排错</h2><p>在“消息转发日志”查看：</p>
+<ul>
+<li>状态（success/failed/skipped）</li>
+<li>失败原因</li>
+<li>转发耗时</li>
+</ul>
+
+      </article>
+      
+  <div class="pager">
+
+    <a class="pager-link" href="/docs/ai-provider.html">← AI回复引擎</a>
+    <a class="pager-link" href="/docs/monitoring.html">消息监控与排障 →</a>
+  </div>
+    </main>
+    <aside class="toc-wrap">
+      <div class="toc-title">本页目录</div>
+      <nav class="toc"><a class="toc-item toc-1" href="#消息转发">消息转发</a><a class="toc-item toc-2" href="#功能范围">功能范围</a><a class="toc-item toc-2" href="#规则结构">规则结构</a><a class="toc-item toc-2" href="#典型场景">典型场景</a><a class="toc-item toc-2" href="#排错">排错</a></nav>
+    </aside>
+  </div>
+  <script>
+    const DOC_ITEMS = [{"title":"概览","slug":"overview","description":"平台定位、能力与目标"},{"title":"快速开始","slug":"quickstart","description":"5分钟跑通链路"},{"title":"核心概念","slug":"core-concepts","description":"机器人、规则、引擎、回调"},{"title":"机器人与回调","slug":"robot-callback","description":"机器人添加与回调绑定"},{"title":"规则配置","slug":"rules","description":"匹配模式、优先级与模板"},{"title":"AI回复引擎","slug":"ai-provider","description":"引擎配置、测试与常见问题"},{"title":"消息转发","slug":"forwarding","description":"转发规则与日志排查"},{"title":"消息监控与排障","slug":"monitoring","description":"监控视图与常见异常"},{"title":"管理员手册","slug":"admin","description":"用户管理与安全建议"},{"title":"部署运维","slug":"deploy","description":"部署、时区、升级建议"},{"title":"常见问题","slug":"faq","description":"高频问题与处理方式"}];
+    const input = document.getElementById('doc-search');
+    const resultEl = document.getElementById('search-results');
+    function renderResults(keyword) {
+      const q = (keyword || '').trim().toLowerCase();
+      if (!q) {
+        resultEl.innerHTML = '';
+        return;
+      }
+      const list = DOC_ITEMS
+        .filter((d) => (d.title + ' ' + (d.description || '')).toLowerCase().includes(q))
+        .slice(0, 8);
+      if (!list.length) {
+        resultEl.innerHTML = '<div class="result-empty">没有匹配结果</div>';
+        return;
+      }
+      resultEl.innerHTML = list
+        .map((d) => '<a class="result-item" href="/docs/' + d.slug + '.html"><div class="result-title">' + d.title + '</div><div class="result-desc">' + (d.description || '') + '</div></a>')
+        .join('');
+    }
+    input?.addEventListener('input', (e) => renderResults(e.target.value));
+  </script>
+</body>
+</html>

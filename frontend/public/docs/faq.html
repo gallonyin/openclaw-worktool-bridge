@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>常见问题 - WorkTool Bridge 文档</title>
+  <meta name="description" content="高频问题与处理方式" />
+  <link rel="canonical" href="/docs/faq.html" />
+  <link rel="stylesheet" href="/docs/assets/docs.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
+      <div id="search-results" class="search-results"></div>
+      <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item" href="/docs/quickstart.html">快速开始</a><a class="nav-item" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item" href="/docs/forwarding.html">消息转发</a><a class="nav-item" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item active" href="/docs/faq.html">常见问题</a></nav>
+    </aside>
+    <main class="main">
+      <article class="doc">
+        <h1 id="常见问题faq">常见问题（FAQ）</h1><h2 id="为什么我能收到消息但不回复">为什么我能收到消息但不回复？</h2><p>优先检查：</p>
+<ul>
+<li>规则是否命中</li>
+<li>AI 引擎是否可用</li>
+<li>群聊是否要求 @ 才回复</li>
+</ul>
+<h2 id="为什么回调绑定显示成功但没生效">为什么回调绑定显示成功但没生效？</h2><p>请在 WorkTool 侧复查当前实际绑定地址，并确认你保存时的 robot_id 正确。</p>
+<h2 id="为什么转发失败">为什么转发失败？</h2><p>查看“消息转发日志”的失败原因，常见是：</p>
+<ul>
+<li>目标名称不存在</li>
+<li>发送机器人不可用</li>
+<li>上游接口错误</li>
+</ul>
+<h2 id="新手最稳妥的上线方式">新手最稳妥的上线方式？</h2><ol>
+<li>先私聊验证</li>
+<li>再测试群灰度</li>
+<li>最后放开全量群聊规则</li>
+</ol>
+
+      </article>
+      
+  <div class="pager">
+
+    <a class="pager-link" href="/docs/deploy.html">← 部署运维</a>
+    <span></span>
+  </div>
+    </main>
+    <aside class="toc-wrap">
+      <div class="toc-title">本页目录</div>
+      <nav class="toc"><a class="toc-item toc-1" href="#常见问题faq">常见问题（FAQ）</a><a class="toc-item toc-2" href="#为什么我能收到消息但不回复">为什么我能收到消息但不回复？</a><a class="toc-item toc-2" href="#为什么回调绑定显示成功但没生效">为什么回调绑定显示成功但没生效？</a><a class="toc-item toc-2" href="#为什么转发失败">为什么转发失败？</a><a class="toc-item toc-2" href="#新手最稳妥的上线方式">新手最稳妥的上线方式？</a></nav>
+    </aside>
+  </div>
+  <script>
+    const DOC_ITEMS = [{"title":"概览","slug":"overview","description":"平台定位、能力与目标"},{"title":"快速开始","slug":"quickstart","description":"5分钟跑通链路"},{"title":"核心概念","slug":"core-concepts","description":"机器人、规则、引擎、回调"},{"title":"机器人与回调","slug":"robot-callback","description":"机器人添加与回调绑定"},{"title":"规则配置","slug":"rules","description":"匹配模式、优先级与模板"},{"title":"AI回复引擎","slug":"ai-provider","description":"引擎配置、测试与常见问题"},{"title":"消息转发","slug":"forwarding","description":"转发规则与日志排查"},{"title":"消息监控与排障","slug":"monitoring","description":"监控视图与常见异常"},{"title":"管理员手册","slug":"admin","description":"用户管理与安全建议"},{"title":"部署运维","slug":"deploy","description":"部署、时区、升级建议"},{"title":"常见问题","slug":"faq","description":"高频问题与处理方式"}];
+    const input = document.getElementById('doc-search');
+    const resultEl = document.getElementById('search-results');
+    function renderResults(keyword) {
+      const q = (keyword || '').trim().toLowerCase();
+      if (!q) {
+        resultEl.innerHTML = '';
+        return;
+      }
+      const list = DOC_ITEMS
+        .filter((d) => (d.title + ' ' + (d.description || '')).toLowerCase().includes(q))
+        .slice(0, 8);
+      if (!list.length) {
+        resultEl.innerHTML = '<div class="result-empty">没有匹配结果</div>';
+        return;
+      }
+      resultEl.innerHTML = list
+        .map((d) => '<a class="result-item" href="/docs/' + d.slug + '.html"><div class="result-title">' + d.title + '</div><div class="result-desc">' + (d.description || '') + '</div></a>')
+        .join('');
+    }
+    input?.addEventListener('input', (e) => renderResults(e.target.value));
+  </script>
+</body>
+</html>

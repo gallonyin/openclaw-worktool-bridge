@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>快速开始 - WorkTool Bridge 文档</title>
+  <meta name="description" content="5分钟跑通链路" />
+  <link rel="canonical" href="/docs/quickstart.html" />
+  <link rel="stylesheet" href="/docs/assets/docs.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
+      <div id="search-results" class="search-results"></div>
+      <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item active" href="/docs/quickstart.html">快速开始</a><a class="nav-item" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item" href="/docs/forwarding.html">消息转发</a><a class="nav-item" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item" href="/docs/faq.html">常见问题</a></nav>
+    </aside>
+    <main class="main">
+      <article class="doc">
+        <h1 id="快速开始5-分钟">快速开始（5 分钟）</h1><h2 id="第一步注册并登录">第一步：注册并登录</h2><p>使用手机号完成注册和登录。</p>
+<h2 id="第二步添加机器人">第二步：添加机器人</h2><p>进入“机器人配置”页面，点击“添加机器人”。</p>
+<p>你需要准备：</p>
+<ul>
+<li>机器人 ID（示例：<code>wtxxxx</code>）</li>
+<li>群聊/私聊回复开关</li>
+<li>是否仅在群聊被 @ 时回复</li>
+</ul>
+<h2 id="第三步绑定消息回调">第三步：绑定消息回调</h2><p>进入“机器人信息”页面。</p>
+<p>如果你不了解回调开发，直接使用“由本平台处理回复消息”。</p>
+<h2 id="第四步添加-ai-回复引擎">第四步：添加 AI 回复引擎</h2><p>进入“AI 回复引擎”页面，新增可用模型渠道。</p>
+<p>建议先用测试引擎验证链路，再替换成正式引擎。</p>
+<h2 id="第五步新增规则">第五步：新增规则</h2><p>进入“机器人配置”，新增群聊或私聊规则。</p>
+<p>重点填写：</p>
+<ul>
+<li>群名/昵称匹配方式</li>
+<li>聊天内容匹配方式</li>
+<li>绑定 AI 回复引擎</li>
+</ul>
+<h2 id="第六步验证效果">第六步：验证效果</h2><p>进入“消息监控”查看机器人是否按预期读消息。</p>
+<p>如果出现失败，查看“失败原因”并在“机器人排查”中进一步定位。</p>
+
+      </article>
+      
+  <div class="pager">
+
+    <a class="pager-link" href="/docs/overview.html">← 概览</a>
+    <a class="pager-link" href="/docs/core-concepts.html">核心概念 →</a>
+  </div>
+    </main>
+    <aside class="toc-wrap">
+      <div class="toc-title">本页目录</div>
+      <nav class="toc"><a class="toc-item toc-1" href="#快速开始5-分钟">快速开始（5 分钟）</a><a class="toc-item toc-2" href="#第一步注册并登录">第一步：注册并登录</a><a class="toc-item toc-2" href="#第二步添加机器人">第二步：添加机器人</a><a class="toc-item toc-2" href="#第三步绑定消息回调">第三步：绑定消息回调</a><a class="toc-item toc-2" href="#第四步添加-ai-回复引擎">第四步：添加 AI 回复引擎</a><a class="toc-item toc-2" href="#第五步新增规则">第五步：新增规则</a><a class="toc-item toc-2" href="#第六步验证效果">第六步：验证效果</a></nav>
+    </aside>
+  </div>
+  <script>
+    const DOC_ITEMS = [{"title":"概览","slug":"overview","description":"平台定位、能力与目标"},{"title":"快速开始","slug":"quickstart","description":"5分钟跑通链路"},{"title":"核心概念","slug":"core-concepts","description":"机器人、规则、引擎、回调"},{"title":"机器人与回调","slug":"robot-callback","description":"机器人添加与回调绑定"},{"title":"规则配置","slug":"rules","description":"匹配模式、优先级与模板"},{"title":"AI回复引擎","slug":"ai-provider","description":"引擎配置、测试与常见问题"},{"title":"消息转发","slug":"forwarding","description":"转发规则与日志排查"},{"title":"消息监控与排障","slug":"monitoring","description":"监控视图与常见异常"},{"title":"管理员手册","slug":"admin","description":"用户管理与安全建议"},{"title":"部署运维","slug":"deploy","description":"部署、时区、升级建议"},{"title":"常见问题","slug":"faq","description":"高频问题与处理方式"}];
+    const input = document.getElementById('doc-search');
+    const resultEl = document.getElementById('search-results');
+    function renderResults(keyword) {
+      const q = (keyword || '').trim().toLowerCase();
+      if (!q) {
+        resultEl.innerHTML = '';
+        return;
+      }
+      const list = DOC_ITEMS
+        .filter((d) => (d.title + ' ' + (d.description || '')).toLowerCase().includes(q))
+        .slice(0, 8);
+      if (!list.length) {
+        resultEl.innerHTML = '<div class="result-empty">没有匹配结果</div>';
+        return;
+      }
+      resultEl.innerHTML = list
+        .map((d) => '<a class="result-item" href="/docs/' + d.slug + '.html"><div class="result-title">' + d.title + '</div><div class="result-desc">' + (d.description || '') + '</div></a>')
+        .join('');
+    }
+    input?.addEventListener('input', (e) => renderResults(e.target.value));
+  </script>
+</body>
+</html>

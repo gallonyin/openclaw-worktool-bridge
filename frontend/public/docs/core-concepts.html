@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>核心概念 - WorkTool Bridge 文档</title>
+  <meta name="description" content="机器人、规则、引擎、回调" />
+  <link rel="canonical" href="/docs/core-concepts.html" />
+  <link rel="stylesheet" href="/docs/assets/docs.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
+      <div id="search-results" class="search-results"></div>
+      <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item" href="/docs/quickstart.html">快速开始</a><a class="nav-item active" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item" href="/docs/forwarding.html">消息转发</a><a class="nav-item" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item" href="/docs/faq.html">常见问题</a></nav>
+    </aside>
+    <main class="main">
+      <article class="doc">
+        <h1 id="核心概念">核心概念</h1><h2 id="机器人">机器人</h2><p>WorkTool 里的一个机器人实体。每个机器人有唯一 robot_id。</p>
+<h2 id="规则">规则</h2><p>规则定义“什么消息该由谁回答”。</p>
+<p>常见维度：</p>
+<ul>
+<li>来源场景：群聊 / 私聊</li>
+<li>对象匹配：全部 / 精准 / 模糊</li>
+<li>内容匹配：全部 / 精准 / 模糊</li>
+<li>权重：同类命中时的优先级</li>
+</ul>
+<h2 id="ai-回复引擎">AI 回复引擎</h2><p>一条可调用的大模型配置，包括：</p>
+<ul>
+<li>Base URL</li>
+<li>API Token</li>
+<li>Model</li>
+<li>引擎类型</li>
+</ul>
+<h2 id="回调">回调</h2><p>WorkTool 把收到的消息推送给本系统的入口。</p>
+<p>如果绑定的是本平台回调地址，本系统可记录更多本地处理信息。</p>
+<h2 id="消息转发">消息转发</h2><p>把机器人收到的文本消息转发到另一个目标（群名或用户昵称/备注名）。</p>
+
+      </article>
+      
+  <div class="pager">
+
+    <a class="pager-link" href="/docs/quickstart.html">← 快速开始</a>
+    <a class="pager-link" href="/docs/robot-callback.html">机器人与回调 →</a>
+  </div>
+    </main>
+    <aside class="toc-wrap">
+      <div class="toc-title">本页目录</div>
+      <nav class="toc"><a class="toc-item toc-1" href="#核心概念">核心概念</a><a class="toc-item toc-2" href="#机器人">机器人</a><a class="toc-item toc-2" href="#规则">规则</a><a class="toc-item toc-2" href="#ai-回复引擎">AI 回复引擎</a><a class="toc-item toc-2" href="#回调">回调</a><a class="toc-item toc-2" href="#消息转发">消息转发</a></nav>
+    </aside>
+  </div>
+  <script>
+    const DOC_ITEMS = [{"title":"概览","slug":"overview","description":"平台定位、能力与目标"},{"title":"快速开始","slug":"quickstart","description":"5分钟跑通链路"},{"title":"核心概念","slug":"core-concepts","description":"机器人、规则、引擎、回调"},{"title":"机器人与回调","slug":"robot-callback","description":"机器人添加与回调绑定"},{"title":"规则配置","slug":"rules","description":"匹配模式、优先级与模板"},{"title":"AI回复引擎","slug":"ai-provider","description":"引擎配置、测试与常见问题"},{"title":"消息转发","slug":"forwarding","description":"转发规则与日志排查"},{"title":"消息监控与排障","slug":"monitoring","description":"监控视图与常见异常"},{"title":"管理员手册","slug":"admin","description":"用户管理与安全建议"},{"title":"部署运维","slug":"deploy","description":"部署、时区、升级建议"},{"title":"常见问题","slug":"faq","description":"高频问题与处理方式"}];
+    const input = document.getElementById('doc-search');
+    const resultEl = document.getElementById('search-results');
+    function renderResults(keyword) {
+      const q = (keyword || '').trim().toLowerCase();
+      if (!q) {
+        resultEl.innerHTML = '';
+        return;
+      }
+      const list = DOC_ITEMS
+        .filter((d) => (d.title + ' ' + (d.description || '')).toLowerCase().includes(q))
+        .slice(0, 8);
+      if (!list.length) {
+        resultEl.innerHTML = '<div class="result-empty">没有匹配结果</div>';
+        return;
+      }
+      resultEl.innerHTML = list
+        .map((d) => '<a class="result-item" href="/docs/' + d.slug + '.html"><div class="result-title">' + d.title + '</div><div class="result-desc">' + (d.description || '') + '</div></a>')
+        .join('');
+    }
+    input?.addEventListener('input', (e) => renderResults(e.target.value));
+  </script>
+</body>
+</html>
