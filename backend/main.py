@@ -4170,7 +4170,42 @@ async def get_robot_info_online_infos(robot_id: str, user: Dict[str, Any] = Depe
 @app.post("/api/v1/robot-info/message-callback/test")
 async def test_robot_message_callback(body: MessageCallbackPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     _require_robot_access(int(user["id"]), (body.robot_id or "").strip())
-    return {"ok": True, "robot_id": body.robot_id, "callback_url": body.callback_url}
+    callback_url = (body.callback_url or "").strip()
+    if not callback_url:
+        raise HTTPException(status_code=400, detail="callback_url required")
+
+    payload = {
+        "spoken": "您好,欢迎使用WorkTool~",
+        "rawSpoken": "@小明 您好,欢迎使用WorkTool~",
+        "receivedName": "WorkTool",
+        "groupName": "WorkTool",
+        "groupRemark": "小明参与的WorkTool",
+        "roomType": 1,
+        "atMe": "true",
+        "textType": 1,
+        "fileBase64": "",
+    }
+    timeout = aiohttp.ClientTimeout(total=8)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(callback_url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+                raw = await resp.text()
+                if resp.status != 200:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"测试失败：回调地址返回 HTTP {resp.status}，响应: {_short_text(raw or '', 220)}",
+                    )
+                return {
+                    "ok": True,
+                    "robot_id": body.robot_id,
+                    "callback_url": callback_url,
+                    "status": resp.status,
+                    "response_preview": _short_text(raw or "", 220),
+                }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"测试失败：{str(e)}")
 
 
 @app.post("/api/v1/robot-info/callbacks/test")
