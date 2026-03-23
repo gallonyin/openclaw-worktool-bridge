@@ -4167,6 +4167,12 @@ async def get_robot_info_online_infos(robot_id: str, user: Dict[str, Any] = Depe
     return await fetch_worktool_api("/robot/robotInfo/onlineInfos", {"robotId": robot_id})
 
 
+@app.get("/api/v1/robot-info/version")
+async def get_robot_info_version(robot_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_robot_access(int(user["id"]), robot_id)
+    return await fetch_worktool_api("/robot/robotInfo/version", {"robotId": robot_id})
+
+
 @app.post("/api/v1/robot-info/message-callback/test")
 async def test_robot_message_callback(body: MessageCallbackPayload, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     _require_robot_access(int(user["id"]), (body.robot_id or "").strip())

@@ -65,6 +65,7 @@ export default function RobotInfoPage() {
   const [callbacks, setCallbacks] = useState<CallbackItem[]>([]);
   const [online, setOnline] = useState<boolean | null>(null);
   const [onlineInfos, setOnlineInfos] = useState<any[]>([]);
+  const [versionLatest, setVersionLatest] = useState<any>(null);
 
   const [tabKey, setTabKey] = useState<CallbackTabKey>('message');
   const [callbackInput, setCallbackInput] = useState('');
@@ -108,11 +109,12 @@ export default function RobotInfoPage() {
     if (!robotId) return;
     setLoading(true);
     try {
-      const [detailRes, callbackRes, onlineRes, onlineInfosRes] = await Promise.all([
+      const [detailRes, callbackRes, onlineRes, onlineInfosRes, versionRes] = await Promise.all([
         api.getRobotInfoDetail(robotId),
         api.getRobotInfoCallbacks(robotId),
         api.getRobotInfoOnline(robotId),
-        api.getRobotInfoOnlineInfos(robotId)
+        api.getRobotInfoOnlineInfos(robotId),
+        api.getRobotInfoVersion(robotId)
       ]);
       const detailData = detailRes?.data || null;
       const callbackData = callbackRes?.data || [];
@@ -123,6 +125,8 @@ export default function RobotInfoPage() {
       setCallbacks(callbackData);
       setOnline(onlineRes?.data === true);
       setOnlineInfos(onlineInfosData);
+      const latestVersion = versionRes?.data?.latest || null;
+      setVersionLatest(latestVersion && typeof latestVersion === "object" ? latestVersion : null);
       const m = new Map<number, string>();
       callbackData.forEach((x: CallbackItem) => m.set(x.type, x.callBackUrl));
       if (tabKey === 'online_status') {
@@ -137,6 +141,7 @@ export default function RobotInfoPage() {
       setCallbacks([]);
       setOnline(null);
       setOnlineInfos([]);
+      setVersionLatest(null);
       setCallbackInput('');
     } finally {
       setLoading(false);
@@ -175,6 +180,9 @@ export default function RobotInfoPage() {
     (a, b) => parseLooseDateTime(b?.onlineTime) - parseLooseDateTime(a?.onlineTime)
   )[0];
   const lastLoginIp = latestOnlineInfo?.ip || detail?.ip || detail?.lastLoginIp || '-';
+  const versionSuffix = versionLatest
+    ? `(${versionLatest?.appVersion || '-'}/${versionLatest?.workVersion || '-'}/${versionLatest?.appName || '-'})`
+    : '';
   const loginFlapStats = useMemo(() => {
     const now = Date.now();
     const dayStartCount = onlineInfos.filter((row: any) => isSameDay(parseLooseDateTime(row?.onlineTime), now)).length;
@@ -436,7 +444,7 @@ export default function RobotInfoPage() {
           </Card>
         </Col>
         <Col xs={24} lg={12}>
-          <Card title="机器人登录日志" extra={<Typography.Link>查看更多</Typography.Link>}>
+          <Card title={`机器人登录日志${versionSuffix}`} extra={<Typography.Link>查看更多</Typography.Link>}>
             {loginFlapStats.shouldWarn ? (
               <Alert
                 style={{ marginBottom: 12 }}

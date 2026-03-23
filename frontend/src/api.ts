@@ -125,6 +125,7 @@ export const api = {
   getRobotInfoCallbacks: (robotId: string) => http.get('/robot-info/callbacks', { params: { robot_id: robotId } }).then((r) => r.data),
   getRobotInfoOnline: (robotId: string) => http.get('/robot-info/online', { params: { robot_id: robotId } }).then((r) => r.data),
   getRobotInfoOnlineInfos: (robotId: string) => http.get('/robot-info/online-infos', { params: { robot_id: robotId } }).then((r) => r.data),
+  getRobotInfoVersion: (robotId: string) => http.get('/robot-info/version', { params: { robot_id: robotId } }).then((r) => r.data),
   testRobotMessageCallback: (robotId: string, callbackUrl: string) =>
     http.post('/robot-info/message-callback/test', { robot_id: robotId, callback_url: callbackUrl }).then((r) => r.data),
   testRobotCallback2xx: (callbackUrl: string) =>
