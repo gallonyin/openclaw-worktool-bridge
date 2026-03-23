@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Button, Card, Select, Space, Table, Tag, Typography, message } from 'antd';
+import { Button, Card, Input, Select, Space, Table, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { api } from '../api';
 import type { Robot } from '../types';
@@ -84,8 +84,9 @@ function mergeRows(commandRows: RawCommandRecord[], resultRows: RawResultRecord[
     const content = String(firstMsg?.receivedContent || '').trim();
     const result = resultMap.get(messageId);
     let status: TaskStatus = 'pending';
-    if (result && Number(result.rawSuccess) === 0) status = 'success';
-    else if (result && Number(result.rawSuccess) === 1) status = 'failed';
+    if (result) {
+      status = Number(result.rawSuccess) === 0 ? 'success' : 'failed';
+    }
 
     const successList = parseTargets(result?.successList);
     const failList = parseTargets(result?.failList);
@@ -118,6 +119,8 @@ export default function CommandTaskPage() {
   const [rows, setRows] = useState<CommandTaskRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState('');
+  const [messageIdInput, setMessageIdInput] = useState('');
+  const [messageIdFilter, setMessageIdFilter] = useState('');
 
   const selectRobot = (nextRobotId?: string) => {
     setRobotId(nextRobotId);
@@ -148,9 +151,12 @@ export default function CommandTaskPage() {
     }
     setLoading(true);
     try {
+      const mid = messageIdFilter.trim();
+      const commandSize = 30;
+      const resultSize = 30;
       const [commandsRes, resultsRes] = await Promise.all([
-        api.getWorktoolRawCommands({ robot_id: robotId, page: 1, size: 50, sort: 'create_time,desc' }),
-        api.getWorktoolRawCommandResults({ robot_id: robotId, page: 1, size: 100, sort: 'run_time,desc' }),
+        api.getWorktoolRawCommands({ robot_id: robotId, page: 1, size: commandSize, sort: 'create_time,desc', message_id: mid || undefined }),
+        api.getWorktoolRawCommandResults({ robot_id: robotId, page: 1, size: resultSize, sort: 'run_time,desc', message_id: mid || undefined }),
       ]);
       const commandRows = (commandsRes?.data?.list || []) as RawCommandRecord[];
       const resultRows = (resultsRes?.data || []) as RawResultRecord[];
@@ -182,7 +188,7 @@ export default function CommandTaskPage() {
 
   useEffect(() => {
     void loadRows();
-  }, [robotId]);
+  }, [robotId, messageIdFilter]);
 
   useEffect(() => {
     if (!robotId) return;
@@ -190,9 +196,9 @@ export default function CommandTaskPage() {
     if (!hasPending) return;
     const timer = window.setInterval(() => {
       void loadRows();
-    }, 10000);
+    }, 60000);
     return () => window.clearInterval(timer);
-  }, [robotId, rows]);
+  }, [robotId, rows, messageIdFilter]);
 
   const columns = useMemo(
     () => [
@@ -233,7 +239,7 @@ export default function CommandTaskPage() {
       title={(
         <Space direction="vertical" size={0}>
           <span>指令任务查询</span>
-          <Typography.Text type="secondary">展示最近50条下发指令，并按 messageId 自动合并执行结果（待执行每10秒刷新）</Typography.Text>
+          <Typography.Text type="secondary">默认展示最近30条下发指令，并按 messageId 自动合并执行结果（待执行每60秒刷新）</Typography.Text>
         </Space>
       )}
       extra={(
@@ -253,6 +259,15 @@ export default function CommandTaskPage() {
           optionFilterProp="label"
         />
         <Tag color={pendingCount > 0 ? 'processing' : 'default'}>待执行: {pendingCount}</Tag>
+        <Input
+          style={{ width: 260 }}
+          placeholder="按 messageId 精准查询"
+          value={messageIdInput}
+          onChange={(e) => setMessageIdInput(e.target.value)}
+          onPressEnter={() => setMessageIdFilter(messageIdInput.trim())}
+          allowClear
+        />
+        <Button onClick={() => setMessageIdFilter(messageIdInput.trim())}>查询</Button>
         <Typography.Text type="secondary">最后刷新: {lastUpdatedAt || '-'}</Typography.Text>
       </Space>
 

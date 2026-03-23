@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>快速开始 - WorkTool Bridge 文档</title>
+  <title>快速开始 - WorkTool Console 文档</title>
   <meta name="description" content="5分钟跑通链路" />
   <link rel="canonical" href="/docs/quickstart.html" />
   <link rel="stylesheet" href="/docs/assets/docs.css" />
@@ -11,20 +11,21 @@
 <body>
   <div class="layout">
     <aside class="sidebar">
-      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <a class="brand" href="/docs/index.html">WorkTool Console 文档</a>
       <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
       <div id="search-results" class="search-results"></div>
       <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item active" href="/docs/quickstart.html">快速开始</a><a class="nav-item" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item" href="/docs/forwarding.html">消息转发</a><a class="nav-item" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item" href="/docs/faq.html">常见问题</a></nav>
     </aside>
     <main class="main">
       <article class="doc">
-        <h1 id="快速开始5-分钟">快速开始（5 分钟）</h1><h2 id="第一步注册并登录">第一步：注册并登录</h2><p>使用手机号完成注册和登录。</p>
+        <h1 id="快速开始5-分钟">快速开始（5 分钟）</h1><h2 id="第一步注册并登录">第一步：注册并登录</h2><p>默认使用手机号完成注册和登录。</p>
+<p>如果客户收不到验证码，管理员可在“用户管理”直接创建账号（手机号+密码）。</p>
 <h2 id="第二步添加机器人">第二步：添加机器人</h2><p>进入“机器人配置”页面，点击“添加机器人”。</p>
 <p>你需要准备：</p>
 <ul>
 <li>机器人 ID（示例：<code>wtxxxx</code>）</li>
 <li>群聊/私聊回复开关</li>
-<li>是否仅在群聊被 @ 时回复</li>
+<li>群聊回复策略（始终回复 / 仅@回复 / AI判断是否需要回复）</li>
 </ul>
 <h2 id="第三步绑定消息回调">第三步：绑定消息回调</h2><p>进入“机器人信息”页面。</p>
 <p>如果你不了解回调开发，直接使用“由本平台处理回复消息”。</p>
@@ -37,8 +38,13 @@
 <li>聊天内容匹配方式</li>
 <li>绑定 AI 回复引擎</li>
 </ul>
-<h2 id="第六步验证效果">第六步：验证效果</h2><p>进入“消息监控”查看机器人是否按预期读消息。</p>
-<p>如果出现失败，查看“失败原因”并在“机器人排查”中进一步定位。</p>
+<h2 id="第六步验证效果">第六步：验证效果</h2><p>按顺序检查：</p>
+<ol>
+<li>进入“消息监控”查看机器人是否按预期读消息</li>
+<li>进入“指令任务查询”确认最近任务是否执行成功</li>
+<li>需要精准定位时，直接按 <code>messageId</code> 查询</li>
+</ol>
+<p>如果出现失败，先看失败原因，再用“机器人排查”进一步定位。</p>
 
       </article>
       

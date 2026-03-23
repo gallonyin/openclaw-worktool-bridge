@@ -65,8 +65,22 @@ export const api = {
     http.post('/auth/register', payload).then((r) => r.data),
   authResetPassword: (payload: { phone: string; sms_code: string; new_password: string }) =>
     http.post('/auth/password/reset', payload).then((r) => r.data),
+  inboxUnreadCount: () => http.get('/inbox/unread-count').then((r) => r.data),
+  inboxMessages: (params: { page?: number; page_size?: number; status?: 'all' | 'read' | 'unread' }) =>
+    http.get('/inbox/messages', { params }).then((r) => r.data),
+  inboxMarkRead: (deliveryId: number) => http.post(`/inbox/${deliveryId}/read`).then((r) => r.data),
+  inboxReadAll: () => http.post('/inbox/read-all').then((r) => r.data),
+  adminInboxMessages: (params: { page?: number; page_size?: number; status?: 'all' | 'draft' | 'published' | 'offline' }) =>
+    http.get('/admin/inbox/messages', { params }).then((r) => r.data),
+  adminCreateInboxMessage: (payload: any) => http.post('/admin/inbox/messages', payload).then((r) => r.data),
+  adminUpdateInboxMessage: (id: number, payload: any) => http.put(`/admin/inbox/messages/${id}`, payload).then((r) => r.data),
+  adminDeleteInboxMessage: (id: number) => http.delete(`/admin/inbox/messages/${id}`).then((r) => r.data),
+  adminPublishInboxMessage: (id: number) => http.post(`/admin/inbox/messages/${id}/publish`).then((r) => r.data),
+  adminOfflineInboxMessage: (id: number) => http.post(`/admin/inbox/messages/${id}/offline`).then((r) => r.data),
   adminListUsers: (params: { phone?: string; page?: number; page_size?: number }) =>
     http.get('/admin/users', { params }).then((r) => r.data),
+  adminCreateUser: (payload: { phone: string; password: string; company_name?: string }) =>
+    http.post('/admin/users', payload).then((r) => r.data),
   health: () => http.get('/health').then((r) => r.data),
   getOverview: () => http.get('/dashboard/overview').then((r) => r.data),
   getTrends: (days = 7) => http.get('/dashboard/trends', { params: { days } }).then((r) => r.data),

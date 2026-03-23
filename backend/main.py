@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -6,7 +7,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set
 
 import aiohttp
 import jwt
@@ -62,6 +63,7 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger("backend")
+_expiry_notice_scan_lock = asyncio.Lock()
 
 
 def now_iso() -> str:
@@ -381,6 +383,47 @@ def init_db() -> None:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS inbox_messages (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  category ENUM('system','ops') NOT NULL DEFAULT 'ops',
+                  level ENUM('info','warning','error') NOT NULL DEFAULT 'info',
+                  title VARCHAR(255) NOT NULL,
+                  content TEXT NOT NULL,
+                  recipient_scope_json JSON NULL,
+                  status ENUM('draft','published','offline') NOT NULL DEFAULT 'draft',
+                  publish_at DATETIME NULL,
+                  expire_at DATETIME NULL,
+                  system_key VARCHAR(128) NULL,
+                  system_ref VARCHAR(255) NULL,
+                  created_by BIGINT NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  INDEX idx_inbox_messages_status_publish (status, publish_at),
+                  INDEX idx_inbox_messages_system (system_key, system_ref),
+                  CONSTRAINT fk_inbox_messages_created_by FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inbox_deliveries (
+                  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                  message_id BIGINT NOT NULL,
+                  user_id BIGINT NOT NULL,
+                  is_read TINYINT(1) NOT NULL DEFAULT 0,
+                  read_at DATETIME NULL,
+                  delivered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  UNIQUE KEY uk_inbox_delivery_message_user (message_id, user_id),
+                  INDEX idx_inbox_deliveries_user_read_time (user_id, is_read, delivered_at),
+                  INDEX idx_inbox_deliveries_message (message_id),
+                  CONSTRAINT fk_inbox_deliveries_message FOREIGN KEY (message_id) REFERENCES inbox_messages(id) ON DELETE CASCADE,
+                  CONSTRAINT fk_inbox_deliveries_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS app_sms_record (
                   id BIGINT PRIMARY KEY AUTO_INCREMENT,
                   account VARCHAR(32) NOT NULL,
@@ -511,6 +554,11 @@ def init_db() -> None:
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO app_settings(`key`,`value`) VALUES('callback_public_base_url','')"
+                )
+            cur.execute("SELECT 1 FROM app_settings WHERE `key`='inbox_expiry_notice_last_scan_date' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO app_settings(`key`,`value`) VALUES('inbox_expiry_notice_last_scan_date','')"
                 )
         conn.commit()
     finally:
@@ -808,6 +856,12 @@ class AuthResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class AdminCreateUserRequest(BaseModel):
+    phone: str
+    password: str
+    company_name: Optional[str] = None
+
+
 class WorkToolSettingsUpdate(BaseModel):
     worktool_api_base: Optional[str] = None
     callback_public_base_url: Optional[str] = None
@@ -947,6 +1001,28 @@ class CallbackTestPayload(BaseModel):
     callback_url: str
 
 
+class InboxMessageCreate(BaseModel):
+    category: Literal["system", "ops"] = "ops"
+    level: Literal["info", "warning", "error"] = "info"
+    title: str
+    content: str
+    recipient_scope: Dict[str, Any] = Field(default_factory=lambda: {"type": "all"})
+    publish_at: Optional[str] = None
+    expire_at: Optional[str] = None
+    publish_now: bool = False
+
+
+class InboxMessageUpdate(BaseModel):
+    category: Optional[Literal["system", "ops"]] = None
+    level: Optional[Literal["info", "warning", "error"]] = None
+    title: Optional[str] = None
+    content: Optional[str] = None
+    recipient_scope: Optional[Dict[str, Any]] = None
+    publish_at: Optional[str] = None
+    expire_at: Optional[str] = None
+    status: Optional[Literal["draft", "published", "offline"]] = None
+
+
 # ----- permission helpers -----
 def _bound_robot_pk_set(user_id: int) -> set:
     conn = db_conn()
@@ -1075,6 +1151,230 @@ def _normalize_extra_json(extra_json: Optional[str]) -> Optional[str]:
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=400, detail="extra_json 必须是JSON对象")
     return json.dumps(parsed, ensure_ascii=False)
+
+
+def _parse_datetime_or_none(raw: Optional[str], raise_on_invalid: bool = True) -> Optional[datetime]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    for candidate in (s, s.replace(" ", "T")):
+        try:
+            return datetime.fromisoformat(candidate)
+        except Exception:
+            continue
+    if raise_on_invalid:
+        raise HTTPException(status_code=400, detail="时间格式不合法，支持 YYYY-MM-DD HH:MM:SS 或 ISO8601")
+    return None
+
+
+def _normalize_recipient_scope(scope: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    data = scope if isinstance(scope, dict) else {}
+    scope_type = str(data.get("type") or "all").strip().lower()
+    if scope_type not in {"all", "admins", "phones"}:
+        raise HTTPException(status_code=400, detail="recipient_scope.type 必须是 all/admins/phones")
+    if scope_type != "phones":
+        return {"type": scope_type}
+    phones_raw = data.get("phones")
+    if not isinstance(phones_raw, list):
+        raise HTTPException(status_code=400, detail="recipient_scope.phones 必须是手机号数组")
+    phones = []
+    seen: Set[str] = set()
+    for x in phones_raw:
+        p = str(x or "").strip()
+        if not _is_valid_phone(p):
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        phones.append(p)
+    if not phones:
+        raise HTTPException(status_code=400, detail="recipient_scope.phones 至少包含一个有效手机号")
+    return {"type": "phones", "phones": phones}
+
+
+def _recipient_scope_json(scope: Dict[str, Any]) -> str:
+    return json.dumps(scope, ensure_ascii=False)
+
+
+def _resolve_recipient_user_ids(cur: Any, scope: Dict[str, Any]) -> List[int]:
+    scope_type = str(scope.get("type") or "all")
+    if scope_type == "all":
+        cur.execute("SELECT id FROM users WHERE is_active=1")
+        return [int(x["id"]) for x in (cur.fetchall() or [])]
+    if scope_type == "admins":
+        cur.execute("SELECT id, phone FROM users WHERE is_active=1")
+        return [int(x["id"]) for x in (cur.fetchall() or []) if _is_admin_phone(str(x.get("phone") or ""))]
+    phones = scope.get("phones") or []
+    if not phones:
+        return []
+    placeholders = ",".join(["%s"] * len(phones))
+    cur.execute(f"SELECT id FROM users WHERE is_active=1 AND phone IN ({placeholders})", tuple(phones))
+    return [int(x["id"]) for x in (cur.fetchall() or [])]
+
+
+def _insert_inbox_deliveries(cur: Any, message_id: int, user_ids: List[int]) -> int:
+    if not user_ids:
+        return 0
+    inserted = 0
+    for uid in user_ids:
+        cur.execute(
+            """
+            INSERT INTO inbox_deliveries(message_id,user_id,is_read,read_at,delivered_at)
+            VALUES(%s,%s,0,NULL,UTC_TIMESTAMP())
+            ON DUPLICATE KEY UPDATE message_id=message_id
+            """,
+            (int(message_id), int(uid)),
+        )
+        inserted += int(cur.rowcount or 0)
+    return inserted
+
+
+def _publish_inbox_message(conn: Any, message_id: int) -> Dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM inbox_messages WHERE id=%s LIMIT 1", (int(message_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="站内信不存在")
+        scope_raw = row.get("recipient_scope_json")
+        scope = scope_raw if isinstance(scope_raw, dict) else {}
+        if not scope:
+            scope = {"type": "all"}
+        recipients = _resolve_recipient_user_ids(cur, scope)
+        inserted = _insert_inbox_deliveries(cur, int(row["id"]), recipients)
+        cur.execute(
+            "UPDATE inbox_messages SET status='published', publish_at=COALESCE(publish_at, UTC_TIMESTAMP()) WHERE id=%s",
+            (int(row["id"]),),
+        )
+    return {"recipient_count": len(recipients), "new_delivery_count": inserted}
+
+
+def _create_system_inbox_message(
+    conn: Any,
+    *,
+    title: str,
+    content: str,
+    level: str,
+    user_ids: List[int],
+    system_key: str,
+    system_ref: str,
+    expire_at: Optional[datetime] = None,
+) -> None:
+    if not user_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO inbox_messages(
+              category,level,title,content,recipient_scope_json,status,publish_at,expire_at,system_key,system_ref,created_by
+            ) VALUES('system',%s,%s,%s,%s,'published',UTC_TIMESTAMP(),%s,%s,%s,NULL)
+            """,
+            (
+                level,
+                title.strip()[:255],
+                content.strip(),
+                _recipient_scope_json({"type": "all"}),
+                expire_at,
+                system_key,
+                system_ref[:255],
+            ),
+        )
+        msg_id = int(cur.lastrowid)
+        _insert_inbox_deliveries(cur, msg_id, user_ids)
+
+
+async def _run_expiry_notice_scan_if_needed() -> None:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    async with _expiry_notice_scan_lock:
+        conn = db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT `value` FROM app_settings WHERE `key`='inbox_expiry_notice_last_scan_date' LIMIT 1"
+                )
+                row = cur.fetchone() or {}
+                if str(row.get("value") or "").strip() == today:
+                    return
+                cur.execute(
+                    """
+                    SELECT ur.user_id, r.robot_id
+                    FROM user_robots ur
+                    JOIN robots r ON r.id=ur.robot_pk
+                    GROUP BY ur.user_id, r.robot_id
+                    """
+                )
+                pairs = cur.fetchall() or []
+            owners: Dict[str, List[int]] = {}
+            for x in pairs:
+                rid = str(x.get("robot_id") or "").strip()
+                uid = int(x.get("user_id") or 0)
+                if not rid or uid <= 0:
+                    continue
+                owners.setdefault(rid, []).append(uid)
+
+            now_utc = datetime.utcnow()
+            for robot_id, user_ids in owners.items():
+                try:
+                    detail = await fetch_worktool_api("/robot/robotInfo/get-detail", {"robotId": robot_id})
+                except Exception as e:
+                    logger.warning("expiry_notice_scan_detail_failed robot_id=%s err=%s", robot_id, str(e))
+                    continue
+                data = detail.get("data") if isinstance(detail, dict) else {}
+                raw_expire = str((data or {}).get("authExpir") or (data or {}).get("authExpire") or "").strip()
+                if not raw_expire:
+                    continue
+                expire_at = _parse_datetime_or_none(raw_expire, raise_on_invalid=False)
+                if not expire_at:
+                    continue
+                delta = expire_at - now_utc
+                if delta.total_seconds() < 0 or delta > timedelta(days=30):
+                    continue
+                days_left = max(int(delta.total_seconds() // 86400), 0)
+                title = f"机器人 {robot_id} 授权将在30天内到期"
+                content = f"请尽快续期，当前预计剩余 {days_left} 天，到期时间：{expire_at.strftime('%Y-%m-%d %H:%M:%S')}。"
+                for uid in user_ids:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT 1
+                            FROM inbox_deliveries d
+                            JOIN inbox_messages m ON m.id=d.message_id
+                            WHERE d.user_id=%s AND m.system_key='robot_expire_30d' AND m.system_ref=%s
+                              AND m.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+                            LIMIT 1
+                            """,
+                            (int(uid), robot_id),
+                        )
+                        if cur.fetchone():
+                            continue
+                    _create_system_inbox_message(
+                        conn,
+                        title=title,
+                        content=content,
+                        level="warning",
+                        user_ids=[int(uid)],
+                        system_key="robot_expire_30d",
+                        system_ref=robot_id,
+                        expire_at=now_utc + timedelta(days=90),
+                    )
+                    conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO app_settings(`key`,`value`) VALUES('inbox_expiry_notice_last_scan_date', %s)
+                    ON DUPLICATE KEY UPDATE `value`=VALUES(`value`), updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (today,),
+                )
+            conn.commit()
+        except Exception as e:
+            logger.warning("expiry_notice_scan_failed err=%s", str(e))
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            conn.close()
 
 
 def get_worktool_api_base() -> str:
@@ -2206,6 +2506,10 @@ async def auth_logout_all(user: Dict[str, Any] = Depends(get_current_user)) -> D
 
 @app.get("/api/v1/auth/me")
 async def auth_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    try:
+        await _run_expiry_notice_scan_if_needed()
+    except Exception:
+        pass
     return {
         "id": int(user["id"]),
         "phone": user["phone"],
@@ -2224,6 +2528,140 @@ async def auth_config() -> Dict[str, Any]:
         "sms_auth_enabled": AUTH_SMS_ENABLED,
         "password_reset_enabled": AUTH_SMS_ENABLED,
     }
+
+
+# ----- inbox -----
+@app.get("/api/v1/inbox/unread-count")
+async def inbox_unread_count(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM inbox_deliveries d
+                JOIN inbox_messages m ON m.id=d.message_id
+                WHERE d.user_id=%s AND d.is_read=0 AND m.status='published'
+                  AND (m.expire_at IS NULL OR m.expire_at > UTC_TIMESTAMP())
+                """,
+                (int(user["id"]),),
+            )
+            c = int((cur.fetchone() or {}).get("c") or 0)
+            return {"count": c}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/inbox/messages")
+async def inbox_messages(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    status: str = Query(default="all"),
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    status_key = (status or "all").strip().lower()
+    if status_key not in {"all", "read", "unread"}:
+        raise HTTPException(status_code=400, detail="status must be all/read/unread")
+    where = [
+        "d.user_id=%s",
+        "m.status='published'",
+        "(m.expire_at IS NULL OR m.expire_at > UTC_TIMESTAMP())",
+    ]
+    params: List[Any] = [int(user["id"])]
+    if status_key == "read":
+        where.append("d.is_read=1")
+    elif status_key == "unread":
+        where.append("d.is_read=0")
+    where_sql = " AND ".join(where)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT COUNT(1) AS c
+                FROM inbox_deliveries d
+                JOIN inbox_messages m ON m.id=d.message_id
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            offset = (page - 1) * page_size
+            cur.execute(
+                f"""
+                SELECT d.id AS delivery_id,d.is_read,d.read_at,d.delivered_at,
+                       m.id AS message_id,m.category,m.level,m.title,m.content,m.publish_at,m.expire_at,m.created_at
+                FROM inbox_deliveries d
+                JOIN inbox_messages m ON m.id=d.message_id
+                WHERE {where_sql}
+                ORDER BY d.delivered_at DESC, d.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params + [page_size, offset]),
+            )
+            rows = cur.fetchall() or []
+            items = [
+                {
+                    "delivery_id": int(x["delivery_id"]),
+                    "message_id": int(x["message_id"]),
+                    "category": x.get("category"),
+                    "level": x.get("level"),
+                    "title": x.get("title") or "",
+                    "content": x.get("content") or "",
+                    "is_read": bool(x.get("is_read")),
+                    "read_at": x.get("read_at").isoformat() if isinstance(x.get("read_at"), datetime) else None,
+                    "delivered_at": x.get("delivered_at").isoformat() if isinstance(x.get("delivered_at"), datetime) else str(x.get("delivered_at") or ""),
+                    "publish_at": x.get("publish_at").isoformat() if isinstance(x.get("publish_at"), datetime) else (str(x.get("publish_at") or "") or None),
+                    "expire_at": x.get("expire_at").isoformat() if isinstance(x.get("expire_at"), datetime) else (str(x.get("expire_at") or "") or None),
+                    "created_at": x.get("created_at").isoformat() if isinstance(x.get("created_at"), datetime) else str(x.get("created_at") or ""),
+                }
+                for x in rows
+            ]
+            return {"items": items, "page": page, "page_size": page_size, "total": total}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/inbox/{delivery_id}/read")
+async def inbox_mark_read(delivery_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE inbox_deliveries
+                SET is_read=1, read_at=COALESCE(read_at, UTC_TIMESTAMP())
+                WHERE id=%s AND user_id=%s
+                """,
+                (int(delivery_id), int(user["id"])),
+            )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/inbox/read-all")
+async def inbox_mark_all_read(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE inbox_deliveries d
+                JOIN inbox_messages m ON m.id=d.message_id
+                SET d.is_read=1, d.read_at=COALESCE(d.read_at, UTC_TIMESTAMP())
+                WHERE d.user_id=%s AND d.is_read=0
+                  AND m.status='published'
+                  AND (m.expire_at IS NULL OR m.expire_at > UTC_TIMESTAMP())
+                """,
+                (int(user["id"]),),
+            )
+            affected = int(cur.rowcount or 0)
+        conn.commit()
+        return {"ok": True, "affected": affected}
+    finally:
+        conn.close()
 
 
 # ----- basic -----
@@ -3777,6 +4215,209 @@ async def troubleshoot_search(body: TroubleshootSearchPayload, user: Dict[str, A
     )
 
 
+@app.get("/api/v1/admin/inbox/messages")
+async def admin_list_inbox_messages(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    status: str = Query(default="all"),
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(user)
+    status_key = (status or "all").strip().lower()
+    if status_key not in {"all", "draft", "published", "offline"}:
+        raise HTTPException(status_code=400, detail="status must be all/draft/published/offline")
+    where = []
+    params: List[Any] = []
+    if status_key != "all":
+        where.append("m.status=%s")
+        params.append(status_key)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(1) AS c FROM inbox_messages m {where_sql}", tuple(params))
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            offset = (page - 1) * page_size
+            cur.execute(
+                f"""
+                SELECT m.*
+                FROM inbox_messages m
+                {where_sql}
+                ORDER BY m.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params + [page_size, offset]),
+            )
+            rows = cur.fetchall() or []
+            items = []
+            for x in rows:
+                scope = x.get("recipient_scope_json")
+                scope_obj = scope if isinstance(scope, dict) else {}
+                items.append(
+                    {
+                        "id": int(x["id"]),
+                        "category": x.get("category"),
+                        "level": x.get("level"),
+                        "title": x.get("title") or "",
+                        "content": x.get("content") or "",
+                        "recipient_scope": scope_obj,
+                        "status": x.get("status"),
+                        "publish_at": x.get("publish_at").isoformat() if isinstance(x.get("publish_at"), datetime) else (str(x.get("publish_at") or "") or None),
+                        "expire_at": x.get("expire_at").isoformat() if isinstance(x.get("expire_at"), datetime) else (str(x.get("expire_at") or "") or None),
+                        "created_by": int(x["created_by"]) if x.get("created_by") is not None else None,
+                        "created_at": x.get("created_at").isoformat() if isinstance(x.get("created_at"), datetime) else str(x.get("created_at") or ""),
+                        "updated_at": x.get("updated_at").isoformat() if isinstance(x.get("updated_at"), datetime) else str(x.get("updated_at") or ""),
+                    }
+                )
+            return {"items": items, "page": page, "page_size": page_size, "total": total}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/admin/inbox/messages")
+async def admin_create_inbox_message(body: InboxMessageCreate, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    title = (body.title or "").strip()
+    content = (body.content or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    if not content:
+        raise HTTPException(status_code=400, detail="content required")
+    scope = _normalize_recipient_scope(body.recipient_scope)
+    publish_at = _parse_datetime_or_none(body.publish_at, raise_on_invalid=True)
+    expire_at = _parse_datetime_or_none(body.expire_at, raise_on_invalid=True)
+    if expire_at and publish_at and expire_at <= publish_at:
+        raise HTTPException(status_code=400, detail="expire_at must be greater than publish_at")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO inbox_messages(
+                  category,level,title,content,recipient_scope_json,status,publish_at,expire_at,created_by
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    body.category,
+                    body.level,
+                    title[:255],
+                    content,
+                    _recipient_scope_json(scope),
+                    "published" if bool(body.publish_now) else "draft",
+                    publish_at if publish_at else (datetime.utcnow() if bool(body.publish_now) else None),
+                    expire_at,
+                    int(user["id"]),
+                ),
+            )
+            message_id = int(cur.lastrowid)
+            publish_result = {"recipient_count": 0, "new_delivery_count": 0}
+            if body.publish_now:
+                publish_result = _publish_inbox_message(conn, message_id)
+        conn.commit()
+        return {"ok": True, "id": message_id, **publish_result}
+    finally:
+        conn.close()
+
+
+@app.put("/api/v1/admin/inbox/messages/{message_id}")
+async def admin_update_inbox_message(
+    message_id: int,
+    body: InboxMessageUpdate,
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(user)
+    updates: List[str] = []
+    params: List[Any] = []
+    if body.category is not None:
+        updates.append("category=%s")
+        params.append(body.category)
+    if body.level is not None:
+        updates.append("level=%s")
+        params.append(body.level)
+    if body.title is not None:
+        title = (body.title or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title required")
+        updates.append("title=%s")
+        params.append(title[:255])
+    if body.content is not None:
+        content = (body.content or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content required")
+        updates.append("content=%s")
+        params.append(content)
+    if body.recipient_scope is not None:
+        scope = _normalize_recipient_scope(body.recipient_scope)
+        updates.append("recipient_scope_json=%s")
+        params.append(_recipient_scope_json(scope))
+    if body.publish_at is not None:
+        updates.append("publish_at=%s")
+        params.append(_parse_datetime_or_none(body.publish_at, raise_on_invalid=True))
+    if body.expire_at is not None:
+        updates.append("expire_at=%s")
+        params.append(_parse_datetime_or_none(body.expire_at, raise_on_invalid=True))
+    if body.status is not None:
+        updates.append("status=%s")
+        params.append(body.status)
+    if not updates:
+        return {"ok": True}
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            params.append(int(message_id))
+            cur.execute(f"UPDATE inbox_messages SET {', '.join(updates)} WHERE id=%s", tuple(params))
+            if cur.rowcount <= 0:
+                raise HTTPException(status_code=404, detail="站内信不存在")
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/v1/admin/inbox/messages/{message_id}")
+async def admin_delete_inbox_message(message_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM inbox_messages WHERE id=%s", (int(message_id),))
+            if cur.rowcount <= 0:
+                raise HTTPException(status_code=404, detail="站内信不存在")
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/admin/inbox/messages/{message_id}/publish")
+async def admin_publish_inbox_message(message_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    conn = db_conn()
+    try:
+        result = _publish_inbox_message(conn, int(message_id))
+        conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/admin/inbox/messages/{message_id}/offline")
+async def admin_offline_inbox_message(message_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE inbox_messages SET status='offline' WHERE id=%s", (int(message_id),))
+            if cur.rowcount <= 0:
+                raise HTTPException(status_code=404, detail="站内信不存在")
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 @app.get("/api/v1/admin/users")
 async def admin_list_users(
     phone: Optional[str] = None,
@@ -3845,6 +4486,34 @@ async def admin_list_users(
             }
         )
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/api/v1/admin/users")
+async def admin_create_user(body: AdminCreateUserRequest, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    phone = (body.phone or "").strip()
+    password = body.password or ""
+    company_name = (body.company_name or "").strip() or None
+    if not _is_valid_phone(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不合法")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="密码长度至少8位")
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE phone=%s LIMIT 1", (phone,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="手机号已存在")
+            cur.execute(
+                "INSERT INTO users(phone,password_hash,company_name,token_version,is_active) VALUES(%s,%s,%s,0,1)",
+                (phone, _hash_password(password), company_name),
+            )
+            uid = int(cur.lastrowid)
+        conn.commit()
+        return {"ok": True, "id": uid, "phone": phone}
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

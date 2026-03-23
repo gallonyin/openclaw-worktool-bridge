@@ -17,6 +17,15 @@ html, body, #root {
 .app-sider {
   background: linear-gradient(180deg, #fffdf8 0%, #f7f2e8 100%) !important;
   border-right: 1px solid rgba(47, 59, 64, 0.08);
+  height: 100vh !important;
+  overflow: hidden;
+}
+
+.app-sider-inner {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
 }
 
 .app-menu {
@@ -37,6 +46,14 @@ html, body, #root {
   font-weight: 600;
 }
 
+.app-sider-footer {
+  padding: 12px;
+  border-top: 1px solid rgba(47, 59, 64, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .topbar {
   background: #fffdf8;
   border-bottom: 1px solid rgba(47, 59, 64, 0.08);
@@ -48,6 +65,8 @@ html, body, #root {
 .content-wrap {
   margin: 16px;
   background: #f6f3ed;
+  overflow: auto;
+  min-height: 0;
 }
 
 .robot-info-matrix {

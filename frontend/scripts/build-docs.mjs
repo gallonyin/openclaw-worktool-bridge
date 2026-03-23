@@ -9,7 +9,7 @@ const projectRoot = path.resolve(__dirname, '..');
 const docsRoot = path.join(projectRoot, 'docs-md');
 const outRoot = path.join(projectRoot, 'public', 'docs');
 
-const siteTitle = 'WorkTool Bridge 文档';
+const siteTitle = 'WorkTool Console 文档';
 const siteBase = '/docs';
 
 const pages = [

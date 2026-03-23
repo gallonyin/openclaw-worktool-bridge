@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>消息监控与排障 - WorkTool Bridge 文档</title>
+  <title>消息监控与排障 - WorkTool Console 文档</title>
   <meta name="description" content="监控视图与常见异常" />
   <link rel="canonical" href="/docs/monitoring.html" />
   <link rel="stylesheet" href="/docs/assets/docs.css" />
@@ -11,7 +11,7 @@
 <body>
   <div class="layout">
     <aside class="sidebar">
-      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <a class="brand" href="/docs/index.html">WorkTool Console 文档</a>
       <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
       <div id="search-results" class="search-results"></div>
       <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item" href="/docs/quickstart.html">快速开始</a><a class="nav-item" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item" href="/docs/forwarding.html">消息转发</a><a class="nav-item active" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item" href="/docs/faq.html">常见问题</a></nav>
@@ -30,6 +30,22 @@
 <li>本平台托管回调：优先展示本地处理记录</li>
 <li>非本平台回调：展示 WorkTool 回调记录</li>
 </ul>
+<h2 id="指令任务查询">指令任务查询</h2><p>“指令任务查询”用于查看机器人任务下发与执行状态：</p>
+<ul>
+<li>默认展示最近 30 条任务</li>
+<li>统一按 <code>messageId</code> 合并“指令下发记录”和“执行结果记录”</li>
+<li>有执行结果且 <code>rawSuccess=0</code>：执行成功</li>
+<li>有执行结果且 <code>rawSuccess!=0</code>：执行失败</li>
+<li>没有执行结果：待执行</li>
+<li>待执行列表每 60 秒自动刷新</li>
+<li>支持按 <code>messageId</code> 精准查询</li>
+</ul>
+<h2 id="机器人登录日志异常提醒">机器人登录日志异常提醒</h2><p>在“机器人信息 &gt; 机器人登录日志”里，系统会判断登录上下线波动：</p>
+<ul>
+<li>最近 24 小时或当天内</li>
+<li>上线+下线记录超过 10 次</li>
+</ul>
+<p>命中后会显示醒目提醒，提示优先检查客户端设备网络稳定性。</p>
 <h2 id="机器人排查">机器人排查</h2><p>管理员可使用排查页查看机器人登录信息与设备信息，例如：</p>
 <ul>
 <li>appVersion</li>
@@ -42,6 +58,7 @@
 <li>AI 请求失败：检查 URL、Token、Model</li>
 <li>回复为空：检查规则命中与 provider 返回结构</li>
 <li>回调失败：检查 WorkTool 侧绑定和网络可达性</li>
+<li>指令长期待执行：优先按 <code>messageId</code> 查询，确认是否有客户端执行记录</li>
 </ul>
 
       </article>
@@ -54,7 +71,7 @@
     </main>
     <aside class="toc-wrap">
       <div class="toc-title">本页目录</div>
-      <nav class="toc"><a class="toc-item toc-1" href="#消息监控与排障">消息监控与排障</a><a class="toc-item toc-2" href="#消息监控">消息监控</a><a class="toc-item toc-2" href="#本地监控与第三方监控">本地监控与第三方监控</a><a class="toc-item toc-2" href="#机器人排查">机器人排查</a><a class="toc-item toc-2" href="#常见异常">常见异常</a></nav>
+      <nav class="toc"><a class="toc-item toc-1" href="#消息监控与排障">消息监控与排障</a><a class="toc-item toc-2" href="#消息监控">消息监控</a><a class="toc-item toc-2" href="#本地监控与第三方监控">本地监控与第三方监控</a><a class="toc-item toc-2" href="#指令任务查询">指令任务查询</a><a class="toc-item toc-2" href="#机器人登录日志异常提醒">机器人登录日志异常提醒</a><a class="toc-item toc-2" href="#机器人排查">机器人排查</a><a class="toc-item toc-2" href="#常见异常">常见异常</a></nav>
     </aside>
   </div>
   <script>

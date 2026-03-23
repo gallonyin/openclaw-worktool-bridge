@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Card, Input, Space, Table, Tag, message } from 'antd';
+import { Button, Card, Form, Input, Modal, Space, Table, Tag, message } from 'antd';
 import { api } from '../api';
 
 interface AdminUserItem {
@@ -45,6 +45,9 @@ export default function UserManagementPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [total, setTotal] = useState(0);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createLoading, setCreateLoading] = useState(false);
+  const [createForm] = Form.useForm();
 
   const load = async (nextPage = page, nextPageSize = pageSize) => {
     setLoading(true);
@@ -72,7 +75,20 @@ export default function UserManagementPage() {
   }, []);
 
   return (
-    <Card title="用户管理">
+    <Card
+      title="用户管理"
+      extra={(
+        <Button
+          type="primary"
+          onClick={() => {
+            createForm.resetFields();
+            setCreateOpen(true);
+          }}
+        >
+          创建用户
+        </Button>
+      )}
+    >
       <Space style={{ marginBottom: 12 }}>
         <Input
           style={{ width: 260 }}
@@ -111,6 +127,56 @@ export default function UserManagementPage() {
           }
         ]}
       />
+      <Modal
+        title="创建用户"
+        open={createOpen}
+        onCancel={() => setCreateOpen(false)}
+        confirmLoading={createLoading}
+        onOk={async () => {
+          const values = await createForm.validateFields();
+          setCreateLoading(true);
+          try {
+            await api.adminCreateUser({
+              phone: String(values.phone || '').trim(),
+              password: String(values.password || ''),
+              company_name: String(values.company_name || '').trim() || undefined,
+            });
+            message.success('创建成功');
+            setCreateOpen(false);
+            void load(1, pageSize);
+          } catch (e: any) {
+            message.error(e?.response?.data?.detail || e?.message || '创建失败');
+          } finally {
+            setCreateLoading(false);
+          }
+        }}
+      >
+        <Form form={createForm} layout="vertical">
+          <Form.Item
+            name="phone"
+            label="手机号"
+            rules={[
+              { required: true, message: '请输入手机号' },
+              { pattern: /^1\d{10}$/, message: '手机号格式不合法' },
+            ]}
+          >
+            <Input placeholder="11位手机号" />
+          </Form.Item>
+          <Form.Item
+            name="password"
+            label="密码"
+            rules={[
+              { required: true, message: '请输入密码' },
+              { min: 8, message: '密码至少8位' },
+            ]}
+          >
+            <Input.Password placeholder="至少8位" />
+          </Form.Item>
+          <Form.Item name="company_name" label="企业名称（可选）">
+            <Input />
+          </Form.Item>
+        </Form>
+      </Modal>
     </Card>
   );
 }

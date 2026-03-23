@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import { Button, Layout, Menu, Space, Typography } from 'antd';
+import { Badge, Button, Layout, Menu, Space, Typography } from 'antd';
 import {
   DashboardOutlined,
   RobotOutlined,
   FileTextOutlined,
   ApiOutlined,
+  BellOutlined,
   ProfileOutlined,
   InfoCircleOutlined,
+  NotificationOutlined,
   SearchOutlined,
   ShareAltOutlined,
   TeamOutlined
@@ -20,11 +22,21 @@ import ForwardPage from './pages/ForwardPage';
 import RobotInfoPage from './pages/RobotInfoPage';
 import TroubleshootPage from './pages/TroubleshootPage';
 import CommandTaskPage from './pages/CommandTaskPage';
+import InboxPage from './pages/InboxPage';
+import InboxAdminPage from './pages/InboxAdminPage';
 import LoginPage from './pages/LoginPage';
 import UserManagementPage from './pages/UserManagementPage';
 import { api, clearAccessToken, getAccessToken } from './api';
 
 const { Header, Sider, Content } = Layout;
+
+function maskPhone(phone?: string) {
+  const p = String(phone || '').trim();
+  if (/^1\d{10}$/.test(p)) {
+    return `${p.slice(0, 3)}****${p.slice(7)}`;
+  }
+  return p || '-';
+}
 
 export default function App() {
   const location = useLocation();
@@ -33,12 +45,15 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authed, setAuthed] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [userPhone, setUserPhone] = useState('');
   const [robotInitChecked, setRobotInitChecked] = useState(false);
+  const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
 
   useEffect(() => {
     if (location.pathname === '/login') {
       setAuthed(false);
       setIsAdmin(false);
+      setUserPhone('');
       setRobotInitChecked(false);
       setAuthReady(true);
       return;
@@ -47,6 +62,7 @@ export default function App() {
     if (!token) {
       setAuthed(false);
       setIsAdmin(false);
+      setUserPhone('');
       setRobotInitChecked(false);
       setAuthReady(true);
       return;
@@ -59,6 +75,7 @@ export default function App() {
         if (mounted) {
           setAuthed(true);
           setIsAdmin(Boolean(me?.is_admin));
+          setUserPhone(String(me?.phone || ''));
           setAuthReady(true);
         }
       })
@@ -67,6 +84,7 @@ export default function App() {
           clearAccessToken();
           setAuthed(false);
           setIsAdmin(false);
+          setUserPhone('');
           setAuthReady(true);
         }
       });
@@ -94,6 +112,31 @@ export default function App() {
       mounted = false;
     };
   }, [authed]);
+
+  useEffect(() => {
+    if (!authed) return;
+    let canceled = false;
+    const loadUnread = async () => {
+      try {
+        const res = await api.inboxUnreadCount();
+        if (!canceled) {
+          setInboxUnreadCount(Number(res?.count || 0));
+        }
+      } catch {
+        if (!canceled) {
+          setInboxUnreadCount(0);
+        }
+      }
+    };
+    void loadUnread();
+    const timer = window.setInterval(() => {
+      void loadUnread();
+    }, 60000);
+    return () => {
+      canceled = true;
+      window.clearInterval(timer);
+    };
+  }, [authed, location.pathname]);
 
   useEffect(() => {
     if (!authed || location.pathname === '/login' || robotInitChecked) {
@@ -134,6 +177,7 @@ export default function App() {
     }
     if (isAdmin) {
       baseItems.push({ key: '/users', icon: <TeamOutlined />, label: <Link to="/users">用户管理</Link> });
+      baseItems.push({ key: '/inbox-admin', icon: <NotificationOutlined />, label: <Link to="/inbox-admin">站内信配置</Link> });
     }
     return baseItems;
   }, [enableTroubleshoot, isAdmin]);
@@ -158,12 +202,29 @@ export default function App() {
   }
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout style={{ height: '100vh', overflow: 'hidden' }}>
       <Sider width={228} className="app-sider">
-        <div className="brand">WorkTool Console</div>
-        <Menu className="app-menu" theme="light" mode="inline" selectedKeys={[location.pathname]} items={items} />
+        <div className="app-sider-inner">
+          <div>
+            <div className="brand">WorkTool Console</div>
+            <Menu className="app-menu" theme="light" mode="inline" selectedKeys={[location.pathname]} items={items} />
+          </div>
+          <div className="app-sider-footer">
+            <Button
+              type="default"
+              icon={<BellOutlined />}
+              block
+              onClick={() => navigate('/inbox')}
+            >
+              <Badge count={inboxUnreadCount} overflowCount={99} offset={[10, 2]}>
+                <span>站内信</span>
+              </Badge>
+            </Button>
+            <Typography.Text type="secondary">账号：{maskPhone(userPhone)}</Typography.Text>
+          </div>
+        </div>
       </Sider>
-      <Layout>
+      <Layout style={{ minWidth: 0 }}>
         <Header className="topbar">
           <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
             <Typography.Title level={4} style={{ margin: 0, color: '#304047' }}>
@@ -202,11 +263,13 @@ export default function App() {
             <Route path="/robot-info" element={<RobotInfoPage />} />
             <Route path="/robots" element={<RobotPage />} />
             <Route path="/logs" element={<MessageLogPage />} />
+            <Route path="/inbox" element={<InboxPage />} />
             <Route path="/command-tasks" element={<CommandTaskPage />} />
             <Route path="/forward" element={<ForwardPage />} />
             <Route path="/providers" element={<AIHubPage />} />
             {enableTroubleshoot && isAdmin ? <Route path="/troubleshoot" element={<TroubleshootPage />} /> : <Route path="/troubleshoot" element={<Navigate to="/dashboard" replace />} />}
             {isAdmin ? <Route path="/users" element={<UserManagementPage />} /> : <Route path="/users" element={<Navigate to="/dashboard" replace />} />}
+            {isAdmin ? <Route path="/inbox-admin" element={<InboxAdminPage />} /> : <Route path="/inbox-admin" element={<Navigate to="/dashboard" replace />} />}
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
         </Content>

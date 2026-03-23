@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>规则配置 - WorkTool Bridge 文档</title>
+  <title>规则配置 - WorkTool Console 文档</title>
   <meta name="description" content="匹配模式、优先级与模板" />
   <link rel="canonical" href="/docs/rules.html" />
   <link rel="stylesheet" href="/docs/assets/docs.css" />
@@ -11,7 +11,7 @@
 <body>
   <div class="layout">
     <aside class="sidebar">
-      <a class="brand" href="/docs/index.html">WorkTool Bridge 文档</a>
+      <a class="brand" href="/docs/index.html">WorkTool Console 文档</a>
       <input id="doc-search" class="search" type="search" placeholder="搜索文档..." />
       <div id="search-results" class="search-results"></div>
       <nav class="nav"><a class="nav-item" href="/docs/overview.html">概览</a><a class="nav-item" href="/docs/quickstart.html">快速开始</a><a class="nav-item" href="/docs/core-concepts.html">核心概念</a><a class="nav-item" href="/docs/robot-callback.html">机器人与回调</a><a class="nav-item active" href="/docs/rules.html">规则配置</a><a class="nav-item" href="/docs/ai-provider.html">AI回复引擎</a><a class="nav-item" href="/docs/forwarding.html">消息转发</a><a class="nav-item" href="/docs/monitoring.html">消息监控与排障</a><a class="nav-item" href="/docs/admin.html">管理员手册</a><a class="nav-item" href="/docs/deploy.html">部署运维</a><a class="nav-item" href="/docs/faq.html">常见问题</a></nav>
@@ -23,6 +23,13 @@
 <li>精准匹配：完全相同</li>
 <li>模糊匹配：支持更灵活匹配（可理解为“包含”）</li>
 </ul>
+<h2 id="群聊回复策略">群聊回复策略</h2><p>机器人配置中的“群聊回复策略”支持 3 种：</p>
+<ul>
+<li>始终回复：@和非@机器人全部根据规则回复</li>
+<li>仅@回复：@机器人且命中规则时回复</li>
+<li>AI判断是否需要回复：群里未@时，先由 AI 判定是否需要机器人回复</li>
+</ul>
+<p>使用 AI 判断时，需要额外选择“群聊判定引擎”。</p>
 <h2 id="推荐配置顺序">推荐配置顺序</h2><ol>
 <li>先做一个“全部匹配”保底规则</li>
 <li>再加“精准匹配”覆盖重点群/人</li>
@@ -34,10 +41,11 @@
 </ul>
 <h2 id="新手模板">新手模板</h2><ul>
 <li>私聊：全部匹配 + 默认 AI 引擎</li>
-<li>群聊：仅在 @ 时回复 + 指定群名精准匹配</li>
+<li>群聊：先用“仅@回复”，稳定后按需切到“AI判断是否需要回复”</li>
 </ul>
 <h2 id="防误触建议">防误触建议</h2><ul>
 <li>对高噪声群设置更严格匹配条件</li>
+<li>群聊 AI 判定模型建议使用低延迟、低成本模型</li>
 <li>先小范围灰度，再全量开启</li>
 </ul>
 
@@ -51,7 +59,7 @@
     </main>
     <aside class="toc-wrap">
       <div class="toc-title">本页目录</div>
-      <nav class="toc"><a class="toc-item toc-1" href="#规则配置指南">规则配置指南</a><a class="toc-item toc-2" href="#匹配模式说明">匹配模式说明</a><a class="toc-item toc-2" href="#推荐配置顺序">推荐配置顺序</a><a class="toc-item toc-2" href="#优先级建议">优先级建议</a><a class="toc-item toc-2" href="#新手模板">新手模板</a><a class="toc-item toc-2" href="#防误触建议">防误触建议</a></nav>
+      <nav class="toc"><a class="toc-item toc-1" href="#规则配置指南">规则配置指南</a><a class="toc-item toc-2" href="#匹配模式说明">匹配模式说明</a><a class="toc-item toc-2" href="#群聊回复策略">群聊回复策略</a><a class="toc-item toc-2" href="#推荐配置顺序">推荐配置顺序</a><a class="toc-item toc-2" href="#优先级建议">优先级建议</a><a class="toc-item toc-2" href="#新手模板">新手模板</a><a class="toc-item toc-2" href="#防误触建议">防误触建议</a></nav>
     </aside>
   </div>
   <script>
