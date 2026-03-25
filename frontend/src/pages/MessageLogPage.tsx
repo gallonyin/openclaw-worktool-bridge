@@ -18,6 +18,8 @@ interface QaLogItem {
   rawSpoken: string;
   question: string;
   answer: string;
+  providerName?: string;
+  aiDecisionReply?: boolean | null;
   messageId: string;
   atMe?: boolean;
 }
@@ -40,6 +42,8 @@ const DEFAULT_VISIBLE_COLUMNS = [
   'atMe',
   'question',
   'answer',
+  'providerName',
+  'aiDecisionReply',
   'timeCost',
   'messageId',
   'url',
@@ -187,6 +191,20 @@ export default function MessageLogPage() {
       { key: 'question', title: '问题', dataIndex: 'question', width: 280, ellipsis: true },
       { key: 'answer', title: '回答', dataIndex: 'answer', width: 280, ellipsis: true },
       {
+        key: 'providerName',
+        title: 'AI回复引擎',
+        dataIndex: 'providerName',
+        width: 160,
+        render: (v: string | undefined) => (v && v.trim() ? v : '-')
+      },
+      {
+        key: 'aiDecisionReply',
+        title: 'AI判断群回复',
+        dataIndex: 'aiDecisionReply',
+        width: 130,
+        render: (v: boolean | null | undefined) => (v === null || v === undefined ? '-' : v ? '是' : '否')
+      },
+      {
         key: 'timeCost',
         title: '耗时(秒)',
         dataIndex: 'timeCost',
@@ -265,19 +283,36 @@ export default function MessageLogPage() {
           trigger="click"
           placement="bottomRight"
           content={(
-            <Space direction="vertical" size={8}>
-              <Checkbox.Group
-                options={columnOptions}
-                value={visibleColumns}
-                onChange={(vals) => {
-                  const next = (vals as string[]).filter(Boolean);
-                  if (next.length === 0) {
-                    message.warning('至少保留一列');
-                    return;
-                  }
-                  setVisibleColumns(next);
+            <Space direction="vertical" size={8} style={{ width: 520, maxWidth: '90vw' }}>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+                  gap: 8,
                 }}
-              />
+              >
+                {columnOptions.map((opt) => (
+                  <Checkbox
+                    key={String(opt.value)}
+                    checked={visibleColumns.includes(String(opt.value))}
+                    onChange={(e) => {
+                      const value = String(opt.value);
+                      const checked = Boolean(e.target.checked);
+                      let next = checked
+                        ? [...visibleColumns, value]
+                        : visibleColumns.filter((x) => x !== value);
+                      next = allColumns.map((c) => String(c.key)).filter((k) => next.includes(k));
+                      if (next.length === 0) {
+                        message.warning('至少保留一列');
+                        return;
+                      }
+                      setVisibleColumns(next);
+                    }}
+                  >
+                    {String(opt.label)}
+                  </Checkbox>
+                ))}
+              </div>
               <Button size="small" onClick={() => setVisibleColumns(DEFAULT_VISIBLE_COLUMNS)}>恢复默认</Button>
             </Space>
           )}

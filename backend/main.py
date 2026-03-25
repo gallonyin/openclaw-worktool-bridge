@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -30,6 +31,14 @@ ENABLE_TROUBLESHOOT = os.getenv("ENABLE_TROUBLESHOOT", "false").strip().lower() 
 ENABLE_RUNTIME_WORKTOOL_SETTINGS = os.getenv("ENABLE_RUNTIME_WORKTOOL_SETTINGS", "false").strip().lower() in {"1", "true", "yes", "on"}
 WORKTOOL_API_BASE_FIXED_RAW = os.getenv("WORKTOOL_API_BASE", "").strip()
 CALLBACK_PUBLIC_BASE_URL_FIXED_RAW = os.getenv("CALLBACK_PUBLIC_BASE_URL", "").strip()
+ENABLE_ADMIN_IP_BLACKLIST = os.getenv("ENABLE_ADMIN_IP_BLACKLIST", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_ADMIN_ENTERPRISE_AUTH = os.getenv("ENABLE_ADMIN_ENTERPRISE_AUTH", "false").strip().lower() in {"1", "true", "yes", "on"}
+WORKTOOL_IPACL_QUERY_PATH = os.getenv("WORKTOOL_IPACL_QUERY_PATH", "").strip()
+WORKTOOL_IPACL_ADD_PATH = os.getenv("WORKTOOL_IPACL_ADD_PATH", "").strip()
+WORKTOOL_IPACL_DELETE_PATH = os.getenv("WORKTOOL_IPACL_DELETE_PATH", "").strip()
+WORKTOOL_WEWORK_AUTH_LIST_PATH = os.getenv("WORKTOOL_WEWORK_AUTH_LIST_PATH", "").strip()
+WORKTOOL_WEWORK_AUTH_SAVE_PATH = os.getenv("WORKTOOL_WEWORK_AUTH_SAVE_PATH", "").strip()
+WORKTOOL_WEWORK_AUTH_DELETE_PATH = os.getenv("WORKTOOL_WEWORK_AUTH_DELETE_PATH", "").strip()
 ADMIN_PHONE_WHITELIST = {
     x.strip()
     for x in os.getenv("ADMIN_PHONE_WHITELIST", "").split(",")
@@ -468,6 +477,8 @@ def init_db() -> None:
                   received_name VARCHAR(255) NULL,
                   question TEXT NULL,
                   answer TEXT NULL,
+                  provider_name VARCHAR(255) NULL,
+                  ai_decision_reply TINYINT(1) NULL,
                   message_id VARCHAR(255) NULL,
                   callback_url VARCHAR(512) NULL,
                   status ENUM('received','success','skipped','failed') NOT NULL DEFAULT 'received',
@@ -480,6 +491,12 @@ def init_db() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            cur.execute("SHOW COLUMNS FROM qa_monitor_logs LIKE 'provider_name'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE qa_monitor_logs ADD COLUMN provider_name VARCHAR(255) NULL AFTER answer")
+            cur.execute("SHOW COLUMNS FROM qa_monitor_logs LIKE 'ai_decision_reply'")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE qa_monitor_logs ADD COLUMN ai_decision_reply TINYINT(1) NULL AFTER provider_name")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS forward_rules (
@@ -757,6 +774,20 @@ def _require_admin(user: Dict[str, Any]) -> None:
         raise HTTPException(status_code=403, detail="仅管理员可访问")
 
 
+def _require_feature_enabled(enabled: bool, feature_name: str) -> None:
+    if not enabled:
+        raise HTTPException(status_code=404, detail=f"{feature_name} disabled")
+
+
+def _require_configured_path(path: str, feature_name: str) -> str:
+    p = (path or "").strip()
+    if not p:
+        raise HTTPException(status_code=503, detail=f"{feature_name} path not configured")
+    if not p.startswith("/"):
+        raise HTTPException(status_code=503, detail=f"{feature_name} path invalid")
+    return p
+
+
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     token = _parse_bearer_token(authorization)
     payload = _decode_access_token(token)
@@ -860,6 +891,15 @@ class AdminCreateUserRequest(BaseModel):
     phone: str
     password: str
     company_name: Optional[str] = None
+
+
+class WeworkAuthorizationSaveRequest(BaseModel):
+    corpId: str
+    corpName: Optional[str] = None
+    agentId: Optional[str] = None
+    isEnabled: Optional[bool] = None
+    expireTime: Optional[str] = None
+    remark: Optional[str] = None
 
 
 class WorkToolSettingsUpdate(BaseModel):
@@ -1377,6 +1417,121 @@ async def _run_expiry_notice_scan_if_needed() -> None:
             conn.close()
 
 
+def _to_unix_ts(value: Any) -> float:
+    dt = _parse_datetime_or_none(str(value or "").strip(), raise_on_invalid=False)
+    if not dt:
+        return 0.0
+    try:
+        return float(dt.timestamp())
+    except Exception:
+        return 0.0
+
+
+async def _run_login_flap_notice_scan_for_user_if_needed(user_id: int) -> None:
+    uid = int(user_id)
+    if uid <= 0:
+        return
+    today_local = datetime.now().strftime("%Y-%m-%d")
+    scan_key = f"inbox_login_flap_scan_user_{uid}"
+    now_ts = time.time()
+    day_start_ts = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `value` FROM app_settings WHERE `key`=%s LIMIT 1", (scan_key,))
+            row = cur.fetchone() or {}
+            if str(row.get("value") or "").strip() == today_local:
+                return
+            cur.execute(
+                """
+                SELECT r.robot_id
+                FROM user_robots ur
+                JOIN robots r ON r.id=ur.robot_pk
+                WHERE ur.user_id=%s
+                ORDER BY r.id DESC
+                """,
+                (uid,),
+            )
+            robot_ids = [str(x.get("robot_id") or "").strip() for x in (cur.fetchall() or [])]
+
+        for robot_id in robot_ids:
+            if not robot_id:
+                continue
+            try:
+                online_infos_res = await fetch_worktool_api("/robot/robotInfo/onlineInfos", {"robotId": robot_id})
+            except Exception as e:
+                logger.warning("login_flap_scan_online_infos_failed user_id=%s robot_id=%s err=%s", uid, robot_id, str(e))
+                continue
+            rows = online_infos_res.get("data") if isinstance(online_infos_res, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+
+            day_start_count = 0
+            recent24h_count = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                ts = _to_unix_ts(row.get("onlineTime"))
+                if ts <= 0:
+                    continue
+                if ts >= day_start_ts:
+                    day_start_count += 1
+                if now_ts - ts <= 24 * 60 * 60:
+                    recent24h_count += 1
+
+            if day_start_count <= 10 and recent24h_count <= 10:
+                continue
+
+            system_ref = f"{robot_id}:{today_local}:{uid}"
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM inbox_deliveries d
+                    JOIN inbox_messages m ON m.id=d.message_id
+                    WHERE d.user_id=%s AND m.system_key='robot_login_flap' AND m.system_ref=%s
+                    LIMIT 1
+                    """,
+                    (uid, system_ref),
+                )
+                if cur.fetchone():
+                    continue
+
+            _create_system_inbox_message(
+                conn,
+                title=f"机器人 {robot_id} 登录上下线波动偏高",
+                content=(
+                    f"24小时 {recent24h_count} 次，今日 {day_start_count} 次。"
+                    "检测到登录日志频繁波动，可能是客户端设备网络状况不佳，建议优先检查设备网络稳定性。"
+                ),
+                level="warning",
+                user_ids=[uid],
+                system_key="robot_login_flap",
+                system_ref=system_ref,
+                expire_at=datetime.utcnow() + timedelta(days=30),
+            )
+            conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_settings(`key`,`value`) VALUES(%s,%s)
+                ON DUPLICATE KEY UPDATE `value`=VALUES(`value`), updated_at=CURRENT_TIMESTAMP
+                """,
+                (scan_key, today_local),
+            )
+        conn.commit()
+    except Exception as e:
+        logger.warning("login_flap_scan_failed user_id=%s err=%s", uid, str(e))
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
 def get_worktool_api_base() -> str:
     if WORKTOOL_API_BASE_FIXED_RAW:
         return normalize_worktool_api_base(WORKTOOL_API_BASE_FIXED_RAW)
@@ -1420,6 +1575,76 @@ async def fetch_worktool_api(path: str, params: Dict[str, Any]) -> Dict[str, Any
                 )
                 raise HTTPException(status_code=502, detail="worktool response is not valid json")
             return data if isinstance(data, dict) else {"data": data}
+
+
+async def post_worktool_api(path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = f"{get_worktool_api_base()}{path}"
+    safe_params = {k: v for k, v in ((params or {}).items()) if v is not None}
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, params=safe_params, json=body) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                detail_msg = f"worktool request failed: status={resp.status}"
+                if raw.strip():
+                    try:
+                        err_data = json.loads(raw)
+                        if isinstance(err_data, dict):
+                            code = err_data.get("code")
+                            msg = err_data.get("message") or err_data.get("msg")
+                            if msg:
+                                detail_msg = f"worktool request failed: {msg}" + (f" (code={code})" if code is not None else "")
+                    except Exception:
+                        preview = raw.strip().replace("\n", " ")[:180]
+                        detail_msg = f"worktool request failed: status={resp.status}, body={preview}"
+                raise HTTPException(status_code=400, detail=detail_msg)
+            if not raw.strip():
+                raise HTTPException(status_code=502, detail="worktool response empty")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                preview = raw.strip().replace("\n", " ")[:200]
+                logger.warning(
+                    "worktool non-json response path=%s status=%s body_preview=%s",
+                    path,
+                    resp.status,
+                    preview,
+                )
+                raise HTTPException(status_code=502, detail="worktool response is not valid json")
+            return data if isinstance(data, dict) else {"data": data}
+
+
+def _ensure_worktool_ok(data: Optional[Dict[str, Any]], action: str) -> None:
+    code = str((data or {}).get("code", ""))
+    if code in {"", "0", "200"}:
+        return
+    msg = (data or {}).get("message") or (data or {}).get("msg") or "unknown"
+    raise HTTPException(status_code=400, detail=f"{action}失败：{msg} (code={code})")
+
+
+def _is_valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address((value or "").strip())
+        return True
+    except Exception:
+        return False
+
+
+def _to_ip_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = re.split(r"[\s,，;；]+", value)
+    else:
+        items = []
+    out: List[str] = []
+    for item in items:
+        ip = str(item or "").strip()
+        if not ip or not _is_valid_ip(ip):
+            continue
+        if ip not in out:
+            out.append(ip)
+    return out
 
 
 async def bind_message_callback(robot_id: str, callback_url: str, reply_all: int = 1) -> Dict[str, Any]:
@@ -1573,6 +1798,15 @@ def _pick_inbound_text(req: QARequest) -> str:
 def _short_text(s: str, n: int = 120) -> str:
     x = (s or "").replace("\n", "\\n").strip()
     return x if len(x) <= n else f"{x[:n]}..."
+
+
+def _public_local_message_id(row_id: Any) -> str:
+    rid = str(row_id or "").strip()
+    if not rid:
+        return "local-unknown"
+    pepper = AUTH_JWT_SECRET or "local-message-id-pepper"
+    digest = hashlib.sha256(f"{rid}|{pepper}".encode("utf-8")).hexdigest()[:16]
+    return f"local-{digest}"
 
 
 def _rule_match_target(scene: str, req: QARequest) -> str:
@@ -1967,16 +2201,29 @@ def _is_duplicate_qa_callback(robot_pk: int, req: QARequest, question: str, wind
         conn.close()
 
 
-def _update_qa_monitor_log(row_id: Optional[int], answer: str, status: str, time_cost: Optional[float] = None) -> None:
+def _update_qa_monitor_log(
+    row_id: Optional[int],
+    answer: str,
+    status: str,
+    time_cost: Optional[float] = None,
+    provider_name: Optional[str] = None,
+    ai_decision_reply: Optional[bool] = None,
+) -> None:
     if not row_id:
         return
     conn = db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE qa_monitor_logs SET answer=%s,status=%s,time_cost=%s WHERE id=%s",
-                ((answer or "")[:4000], status, None if time_cost is None else round(float(time_cost), 3), int(row_id)),
-            )
+            updates = ["answer=%s", "status=%s", "time_cost=%s"]
+            params: List[Any] = [((answer or "")[:4000]), status, None if time_cost is None else round(float(time_cost), 3)]
+            if provider_name is not None:
+                updates.append("provider_name=%s")
+                params.append((provider_name or "").strip()[:255] or None)
+            if ai_decision_reply is not None:
+                updates.append("ai_decision_reply=%s")
+                params.append(1 if ai_decision_reply else 0)
+            params.append(int(row_id))
+            cur.execute(f"UPDATE qa_monitor_logs SET {', '.join(updates)} WHERE id=%s", tuple(params))
         conn.commit()
     except Exception as e:
         logger.warning("qa_monitor_log_update_failed row_id=%s err=%s", row_id, str(e))
@@ -2236,6 +2483,57 @@ async def _call_provider(rule: Dict[str, Any], prompt: str) -> str:
             return text
 
 
+async def _call_openclaw_webhook(rule: Dict[str, Any], callback_payload: Dict[str, Any]) -> Dict[str, Any]:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    auth_scheme = str(rule.get("auth_scheme") or "bearer")
+    api_token = str(rule.get("api_token") or "")
+    if auth_scheme == "bearer" and api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    elif auth_scheme == "x-openclaw-token" and api_token:
+        headers["x-openclaw-token"] = api_token
+
+    url = str(rule.get("base_url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=500, detail="provider base_url empty")
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    started = time.perf_counter()
+    logger.info(
+        "openclaw_webhook_start rule_id=%s provider_id=%s provider_name=%s url=%s auth_scheme=%s payload=%s",
+        rule.get("id"),
+        rule.get("provider_id"),
+        rule.get("provider_name"),
+        url,
+        auth_scheme,
+        _short_text(json.dumps(callback_payload, ensure_ascii=False), 300),
+    )
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=callback_payload, headers=headers) as resp:
+            raw = await resp.text()
+            if resp.status >= 400:
+                logger.warning(
+                    "openclaw_webhook_http_error rule_id=%s provider_id=%s status=%s cost_ms=%s body=%s",
+                    rule.get("id"),
+                    rule.get("provider_id"),
+                    resp.status,
+                    int((time.perf_counter() - started) * 1000),
+                    _short_text(raw, 300),
+                )
+                raise HTTPException(status_code=502, detail=f"openclaw webhook status={resp.status}")
+            logger.info(
+                "openclaw_webhook_success rule_id=%s provider_id=%s cost_ms=%s response=%s",
+                rule.get("id"),
+                rule.get("provider_id"),
+                int((time.perf_counter() - started) * 1000),
+                _short_text(raw, 200),
+            )
+            try:
+                data = json.loads(raw) if raw else {}
+                return data if isinstance(data, dict) else {"raw": raw}
+            except Exception:
+                return {"raw": raw}
+
+
 async def _send_worktool_text_to_target(robot_id: str, target: str, text: str) -> Dict[str, Any]:
     if not target:
         raise HTTPException(status_code=400, detail="worktool target empty")
@@ -2439,7 +2737,7 @@ async def auth_login(body: AuthLoginRequest) -> Dict[str, Any]:
             user = cur.fetchone()
             if not user or int(user["is_active"]) != 1 or not _verify_password(password, str(user["password_hash"])):
                 raise HTTPException(status_code=401, detail="手机号或密码错误")
-            cur.execute("UPDATE users SET last_login_at=UTC_TIMESTAMP() WHERE id=%s", (int(user["id"]),))
+            cur.execute("UPDATE users SET last_login_at=CURRENT_TIMESTAMP() WHERE id=%s", (int(user["id"]),))
         conn.commit()
         token = _create_access_token(int(user["id"]), int(user["token_version"]))
         return {
@@ -2508,6 +2806,10 @@ async def auth_logout_all(user: Dict[str, Any] = Depends(get_current_user)) -> D
 async def auth_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     try:
         await _run_expiry_notice_scan_if_needed()
+    except Exception:
+        pass
+    try:
+        await _run_login_flap_notice_scan_for_user_if_needed(int(user["id"]))
     except Exception:
         pass
     return {
@@ -2667,7 +2969,14 @@ async def inbox_mark_all_read(user: Dict[str, Any] = Depends(get_current_user)) 
 # ----- basic -----
 @app.get("/api/v1/health")
 async def health() -> Dict[str, Any]:
-    return {"status": "healthy", "version": APP_VERSION, "time": now_iso(), "enable_troubleshoot": ENABLE_TROUBLESHOOT}
+    return {
+        "status": "healthy",
+        "version": APP_VERSION,
+        "time": now_iso(),
+        "enable_troubleshoot": ENABLE_TROUBLESHOOT,
+        "enable_admin_ip_blacklist": ENABLE_ADMIN_IP_BLACKLIST,
+        "enable_admin_enterprise_auth": ENABLE_ADMIN_ENTERPRISE_AUTH,
+    }
 
 
 @app.get("/api/v1/settings/worktool")
@@ -3102,19 +3411,16 @@ async def test_provider(body: ProviderTestRequest, user: Dict[str, Any] = Depend
         token = (body.api_token or "").strip()
         if token:
             cfg["api_token"] = token
-        elif not cfg.get("api_token"):
-            raise HTTPException(status_code=400, detail="API Token 不能为空")
 
     base_url = str(cfg.get("base_url") or "").strip()
     if not base_url:
         raise HTTPException(status_code=400, detail="Base URL 不能为空")
 
-    api_token = str(cfg.get("api_token") or "").strip()
-    if not api_token:
-        raise HTTPException(status_code=400, detail="API Token 不能为空")
-
     provider_type = str(cfg.get("provider_type") or "openai")
     auth_scheme = _resolve_auth_scheme(provider_type, cfg.get("auth_scheme"))
+    api_token = str(cfg.get("api_token") or "").strip()
+    if provider_type != "openclaw" and not api_token:
+        raise HTTPException(status_code=400, detail="API Token 不能为空")
     extra_json = cfg.get("extra_json")
     if isinstance(extra_json, dict):
         extra_json = json.dumps(extra_json, ensure_ascii=False)
@@ -3131,6 +3437,22 @@ async def test_provider(body: ProviderTestRequest, user: Dict[str, Any] = Depend
         "extra_json": extra_json,
     }
     started = time.perf_counter()
+    if provider_type == "openclaw":
+        sample_payload = {
+            "spoken": "您好,欢迎使用WorkTool~",
+            "rawSpoken": "@小明 您好,欢迎使用WorkTool~",
+            "receivedName": "WorkTool",
+            "groupName": "WorkTool",
+            "groupRemark": "小明参与的WorkTool",
+            "roomType": 1,
+            "atMe": True,
+            "textType": 1,
+            "fileBase64": "",
+        }
+        resp = await _call_openclaw_webhook(test_rule, sample_payload)
+        elapsed = round(time.perf_counter() - started, 3)
+        return {"ok": True, "elapsed_seconds": elapsed, "response_preview": _short_text(json.dumps(resp, ensure_ascii=False), 200)}
+
     reply = await _call_provider(test_rule, "hi")
     elapsed = round(time.perf_counter() - started, 3)
     return {"ok": True, "elapsed_seconds": elapsed, "reply_preview": _short_text(reply, 200)}
@@ -3810,6 +4132,22 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
     inbound_text = _pick_inbound_text(req)
     match_target = _rule_match_target(scene, req)
     callback_message_id = _pick_message_id(req)
+    try:
+        raw_payload = await request.json()
+    except Exception:
+        raw_payload = {}
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+    callback_payload: Dict[str, Any] = dict(raw_payload)
+    callback_payload.setdefault("spoken", req.spoken)
+    callback_payload.setdefault("rawSpoken", req.rawSpoken)
+    callback_payload.setdefault("receivedName", req.receivedName)
+    callback_payload.setdefault("groupName", req.groupName)
+    callback_payload.setdefault("roomType", req.roomType)
+    callback_payload.setdefault("atMe", req.atMe)
+    callback_payload.setdefault("textType", req.textType)
+    callback_payload.setdefault("messageId", req.messageId)
+    ai_decision_reply: Optional[bool] = None
 
     # Only text callbacks should trigger QA reply pipeline.
     if int(req.textType or 0) != 1:
@@ -3879,10 +4217,11 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
                 return QAResponse(code=0, message="参数接收成功")
             if group_reply_mode == "ai_decide":
                 should_reply = await _should_reply_group_by_ai_decision(robot, req, inbound_text)
+                ai_decision_reply = bool(should_reply)
                 if not should_reply:
                     logger.info("qa_callback_skipped robot_id=%s reason=group_ai_decide_no", robot_id)
                     _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
-                    _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at)
+                    _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at, ai_decision_reply=ai_decision_reply)
                     return QAResponse(code=0, message="参数接收成功")
 
     selected_rule: Optional[Dict[str, Any]] = None
@@ -3938,14 +4277,14 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
             try:
                 await _send_worktool_text(robot_id, scene, req, default_reply)
                 _insert_message_log(robot_pk, "outbound", scene, default_reply, "success")
-                _update_qa_monitor_log(local_log_id, default_reply, "success", time.perf_counter() - started_at)
+                _update_qa_monitor_log(local_log_id, default_reply, "success", time.perf_counter() - started_at, ai_decision_reply=ai_decision_reply)
             except Exception as e:
                 logger.exception("qa_callback_default_reply_send_failed robot_id=%s scene=%s err=%s", robot_id, scene, str(e))
                 _insert_message_log(robot_pk, "outbound", scene, str(e), "failed")
-                _update_qa_monitor_log(local_log_id, str(e), "failed", time.perf_counter() - started_at)
+                _update_qa_monitor_log(local_log_id, str(e), "failed", time.perf_counter() - started_at, ai_decision_reply=ai_decision_reply)
             return QAResponse(code=0, message="参数接收成功")
         _insert_message_log(robot_pk, "outbound", scene, "", "skipped")
-        _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at)
+        _update_qa_monitor_log(local_log_id, "", "skipped", time.perf_counter() - started_at, ai_decision_reply=ai_decision_reply)
         return QAResponse(code=0, message="参数接收成功")
 
     logger.info(
@@ -3961,10 +4300,33 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
         selected_rank,
     )
     try:
+        provider_type = str(selected_rule.get("provider_type") or "openai").strip().lower()
+        provider_name = str(selected_rule.get("provider_name") or "").strip() or None
+        if provider_type == "openclaw":
+            openclaw_res = await _call_openclaw_webhook(selected_rule, callback_payload)
+            reply_text = f"[openclaw passthrough] {str(openclaw_res.get('messageId') or openclaw_res.get('message') or 'accepted')}"
+            _insert_message_log(robot_pk, "outbound", scene, reply_text, "success")
+            _update_qa_monitor_log(
+                local_log_id,
+                reply_text,
+                "success",
+                time.perf_counter() - started_at,
+                provider_name=provider_name,
+                ai_decision_reply=ai_decision_reply,
+            )
+            return QAResponse(code=0, message="参数接收成功")
+
         reply_text = await _call_provider(selected_rule, inbound_text)
         await _send_worktool_text(robot_id, scene, req, reply_text)
         _insert_message_log(robot_pk, "outbound", scene, reply_text, "success")
-        _update_qa_monitor_log(local_log_id, reply_text, "success", time.perf_counter() - started_at)
+        _update_qa_monitor_log(
+            local_log_id,
+            reply_text,
+            "success",
+            time.perf_counter() - started_at,
+            provider_name=provider_name,
+            ai_decision_reply=ai_decision_reply,
+        )
         return QAResponse(code=0, message="参数接收成功")
     except Exception as e:
         logger.exception(
@@ -3976,19 +4338,52 @@ async def qa_callback(robot_id: str, req: QARequest, request: Request) -> QAResp
             str(e),
         )
         _insert_message_log(robot_pk, "outbound", scene, str(e), "failed")
+        provider_type = str(selected_rule.get("provider_type") or "openai").strip().lower()
+        provider_name = str(selected_rule.get("provider_name") or "").strip() or None
+        if provider_type == "openclaw":
+            _update_qa_monitor_log(
+                local_log_id,
+                str(e),
+                "failed",
+                time.perf_counter() - started_at,
+                provider_name=provider_name,
+                ai_decision_reply=ai_decision_reply,
+            )
+            return QAResponse(code=0, message="参数接收成功")
         default_reply = _load_default_reply(robot_pk, scene)
         if default_reply:
             logger.info("qa_callback_fallback_default_reply robot_id=%s scene=%s", robot_id, scene)
             try:
                 await _send_worktool_text(robot_id, scene, req, default_reply)
                 _insert_message_log(robot_pk, "outbound", scene, default_reply, "success")
-                _update_qa_monitor_log(local_log_id, default_reply, "success", time.perf_counter() - started_at)
+                _update_qa_monitor_log(
+                    local_log_id,
+                    default_reply,
+                    "success",
+                    time.perf_counter() - started_at,
+                    provider_name=provider_name,
+                    ai_decision_reply=ai_decision_reply,
+                )
             except Exception as e2:
                 logger.exception("qa_callback_fallback_send_failed robot_id=%s scene=%s err=%s", robot_id, scene, str(e2))
                 _insert_message_log(robot_pk, "outbound", scene, str(e2), "failed")
-                _update_qa_monitor_log(local_log_id, str(e2), "failed", time.perf_counter() - started_at)
+                _update_qa_monitor_log(
+                    local_log_id,
+                    str(e2),
+                    "failed",
+                    time.perf_counter() - started_at,
+                    provider_name=provider_name,
+                    ai_decision_reply=ai_decision_reply,
+                )
             return QAResponse(code=0, message="参数接收成功")
-        _update_qa_monitor_log(local_log_id, str(e), "failed", time.perf_counter() - started_at)
+        _update_qa_monitor_log(
+            local_log_id,
+            str(e),
+            "failed",
+            time.perf_counter() - started_at,
+            provider_name=provider_name,
+            ai_decision_reply=ai_decision_reply,
+        )
         return QAResponse(code=0, message="参数接收成功")
 
 
@@ -4104,7 +4499,7 @@ async def get_message_monitor_logs(
             offset = (page - 1) * size
             cur.execute(
                 f"""
-                SELECT q.id,q.room_type,q.text_type,q.at_me,q.group_name,q.received_name,q.question,q.answer,q.message_id,q.callback_url,q.time_cost,q.created_at
+                SELECT q.id,q.room_type,q.text_type,q.at_me,q.group_name,q.received_name,q.question,q.answer,q.provider_name,q.ai_decision_reply,q.message_id,q.callback_url,q.time_cost,q.created_at
                 FROM qa_monitor_logs q
                 WHERE {where_sql}
                 ORDER BY q.id DESC
@@ -4131,7 +4526,9 @@ async def get_message_monitor_logs(
                         "rawSpoken": row.get("question") or "",
                         "question": row.get("question") or "",
                         "answer": row.get("answer") or "",
-                        "messageId": row.get("message_id") or f"local-{row.get('id')}",
+                        "providerName": row.get("provider_name") or "",
+                        "aiDecisionReply": None if row.get("ai_decision_reply") is None else bool(row.get("ai_decision_reply")),
+                        "messageId": row.get("message_id") or _public_local_message_id(row.get("id")),
                         "atMe": bool(row.get("at_me")),
                     }
                 )
@@ -4457,6 +4854,102 @@ async def admin_offline_inbox_message(message_id: int, user: Dict[str, Any] = De
         return {"ok": True}
     finally:
         conn.close()
+
+
+@app.get("/api/v1/admin/ip-acl/blacklist")
+async def admin_ip_acl_blacklist_query(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    _require_feature_enabled(ENABLE_ADMIN_IP_BLACKLIST, "admin ip blacklist")
+    query_path = _require_configured_path(WORKTOOL_IPACL_QUERY_PATH, "WORKTOOL_IPACL_QUERY_PATH")
+    raw = await fetch_worktool_api(query_path, {})
+    data = raw.get("data") if isinstance(raw, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    whitelist = _to_ip_list(data.get("whiteList") or data.get("whitelist") or data.get("white_list"))
+    blacklist = _to_ip_list(data.get("blackList") or data.get("blacklist") or data.get("black_list"))
+    if whitelist:
+        mode = "whitelist_only"
+    elif blacklist:
+        mode = "blacklist_block"
+    else:
+        mode = "allow_all"
+    return {"mode": mode, "blacklist": blacklist, "blacklist_count": len(blacklist)}
+
+
+@app.post("/api/v1/admin/ip-acl/blacklist/add")
+async def admin_ip_acl_blacklist_add(ip: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    _require_feature_enabled(ENABLE_ADMIN_IP_BLACKLIST, "admin ip blacklist")
+    add_path = _require_configured_path(WORKTOOL_IPACL_ADD_PATH, "WORKTOOL_IPACL_ADD_PATH")
+    target_ip = (ip or "").strip()
+    if not _is_valid_ip(target_ip):
+        raise HTTPException(status_code=400, detail="ip格式不合法")
+    res = await post_worktool_api(add_path, {"ip": target_ip, "type": "blacklist"})
+    _ensure_worktool_ok(res, "新增黑名单IP")
+    return {"ok": True, "ip": target_ip}
+
+
+@app.post("/api/v1/admin/ip-acl/blacklist/delete")
+async def admin_ip_acl_blacklist_delete(ip: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    _require_feature_enabled(ENABLE_ADMIN_IP_BLACKLIST, "admin ip blacklist")
+    delete_path = _require_configured_path(WORKTOOL_IPACL_DELETE_PATH, "WORKTOOL_IPACL_DELETE_PATH")
+    target_ip = (ip or "").strip()
+    if not _is_valid_ip(target_ip):
+        raise HTTPException(status_code=400, detail="ip格式不合法")
+    res = await post_worktool_api(delete_path, {"ip": target_ip, "type": "blacklist"})
+    _ensure_worktool_ok(res, "删除黑名单IP")
+    return {"ok": True, "ip": target_ip}
+
+
+@app.get("/api/v1/admin/wework/authorization/list")
+async def admin_wework_authorization_list(
+    corp_id: Optional[str] = None,
+    corp_name: Optional[str] = None,
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(user)
+    _require_feature_enabled(ENABLE_ADMIN_ENTERPRISE_AUTH, "admin enterprise auth")
+    list_path = _require_configured_path(WORKTOOL_WEWORK_AUTH_LIST_PATH, "WORKTOOL_WEWORK_AUTH_LIST_PATH")
+    params: Dict[str, Any] = {}
+    if (corp_id or "").strip():
+        params["corpId"] = (corp_id or "").strip()
+    if (corp_name or "").strip():
+        params["corpName"] = (corp_name or "").strip()
+    return await fetch_worktool_api(list_path, params)
+
+
+@app.post("/api/v1/admin/wework/authorization/save")
+async def admin_wework_authorization_save(
+    body: WeworkAuthorizationSaveRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(user)
+    _require_feature_enabled(ENABLE_ADMIN_ENTERPRISE_AUTH, "admin enterprise auth")
+    save_path = _require_configured_path(WORKTOOL_WEWORK_AUTH_SAVE_PATH, "WORKTOOL_WEWORK_AUTH_SAVE_PATH")
+    corp_id = (body.corpId or "").strip()
+    if not corp_id:
+        raise HTTPException(status_code=400, detail="corpId required")
+    payload: Dict[str, Any] = {
+        "corpId": corp_id,
+        "corpName": (body.corpName or "").strip(),
+        "agentId": (body.agentId or "").strip(),
+        "isEnabled": bool(body.isEnabled) if body.isEnabled is not None else True,
+        "expireTime": (body.expireTime or "").strip(),
+        "remark": (body.remark or "").strip(),
+    }
+    return await post_worktool_api(save_path, body=payload)
+
+
+@app.post("/api/v1/admin/wework/authorization/delete")
+async def admin_wework_authorization_delete(corp_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _require_admin(user)
+    _require_feature_enabled(ENABLE_ADMIN_ENTERPRISE_AUTH, "admin enterprise auth")
+    delete_path = _require_configured_path(WORKTOOL_WEWORK_AUTH_DELETE_PATH, "WORKTOOL_WEWORK_AUTH_DELETE_PATH")
+    target = (corp_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="corp_id required")
+    return await post_worktool_api(delete_path, {"corpId": target})
 
 
 @app.get("/api/v1/admin/users")

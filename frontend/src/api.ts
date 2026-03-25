@@ -77,6 +77,21 @@ export const api = {
   adminDeleteInboxMessage: (id: number) => http.delete(`/admin/inbox/messages/${id}`).then((r) => r.data),
   adminPublishInboxMessage: (id: number) => http.post(`/admin/inbox/messages/${id}/publish`).then((r) => r.data),
   adminOfflineInboxMessage: (id: number) => http.post(`/admin/inbox/messages/${id}/offline`).then((r) => r.data),
+  adminIpAclBlacklistQuery: () => http.get('/admin/ip-acl/blacklist').then((r) => r.data),
+  adminIpAclBlacklistAdd: (ip: string) => http.post('/admin/ip-acl/blacklist/add', null, { params: { ip } }).then((r) => r.data),
+  adminIpAclBlacklistDelete: (ip: string) => http.post('/admin/ip-acl/blacklist/delete', null, { params: { ip } }).then((r) => r.data),
+  adminWeworkAuthorizationList: (params?: { corp_id?: string; corp_name?: string }) =>
+    http.get('/admin/wework/authorization/list', { params }).then((r) => r.data),
+  adminWeworkAuthorizationSave: (payload: {
+    corpId: string;
+    corpName?: string;
+    agentId?: string;
+    isEnabled?: boolean;
+    expireTime?: string;
+    remark?: string;
+  }) => http.post('/admin/wework/authorization/save', payload).then((r) => r.data),
+  adminWeworkAuthorizationDelete: (corpId: string) =>
+    http.post('/admin/wework/authorization/delete', null, { params: { corp_id: corpId } }).then((r) => r.data),
   adminListUsers: (params: { phone?: string; page?: number; page_size?: number }) =>
     http.get('/admin/users', { params }).then((r) => r.data),
   adminCreateUser: (payload: { phone: string; password: string; company_name?: string }) =>

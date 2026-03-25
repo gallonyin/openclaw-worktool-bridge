@@ -7,11 +7,13 @@ import {
   FileTextOutlined,
   ApiOutlined,
   BellOutlined,
+  BuildOutlined,
   ProfileOutlined,
   InfoCircleOutlined,
   NotificationOutlined,
   SearchOutlined,
   ShareAltOutlined,
+  StopOutlined,
   TeamOutlined
 } from '@ant-design/icons';
 import DashboardPage from './pages/DashboardPage';
@@ -26,6 +28,8 @@ import InboxPage from './pages/InboxPage';
 import InboxAdminPage from './pages/InboxAdminPage';
 import LoginPage from './pages/LoginPage';
 import UserManagementPage from './pages/UserManagementPage';
+import IpBlacklistPage from './pages/IpBlacklistPage';
+import EnterpriseAuthorizationPage from './pages/EnterpriseAuthorizationPage';
 import { api, clearAccessToken, getAccessToken } from './api';
 
 const { Header, Sider, Content } = Layout;
@@ -42,6 +46,8 @@ export default function App() {
   const location = useLocation();
   const navigate = useNavigate();
   const [enableTroubleshoot, setEnableTroubleshoot] = useState(false);
+  const [enableAdminIpBlacklist, setEnableAdminIpBlacklist] = useState(false);
+  const [enableAdminEnterpriseAuth, setEnableAdminEnterpriseAuth] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [authed, setAuthed] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -101,11 +107,15 @@ export default function App() {
       .then((d) => {
         if (mounted) {
           setEnableTroubleshoot(Boolean(d?.enable_troubleshoot));
+          setEnableAdminIpBlacklist(Boolean(d?.enable_admin_ip_blacklist));
+          setEnableAdminEnterpriseAuth(Boolean(d?.enable_admin_enterprise_auth));
         }
       })
       .catch(() => {
         if (mounted) {
           setEnableTroubleshoot(false);
+          setEnableAdminIpBlacklist(false);
+          setEnableAdminEnterpriseAuth(false);
         }
       });
     return () => {
@@ -163,7 +173,7 @@ export default function App() {
   }, [authed, location.pathname, navigate, robotInitChecked]);
 
   const items = useMemo(() => {
-    const baseItems = [
+    const baseItems: any[] = [
       { key: '/dashboard', icon: <DashboardOutlined />, label: <Link to="/dashboard">控制台</Link> },
       { key: '/robot-info', icon: <InfoCircleOutlined />, label: <Link to="/robot-info">机器人信息</Link> },
       { key: '/robots', icon: <RobotOutlined />, label: <Link to="/robots">机器人配置</Link> },
@@ -176,11 +186,18 @@ export default function App() {
       baseItems.push({ key: '/troubleshoot', icon: <SearchOutlined />, label: <Link to="/troubleshoot">机器人排查</Link> });
     }
     if (isAdmin) {
+      baseItems.push({ type: 'divider' });
       baseItems.push({ key: '/users', icon: <TeamOutlined />, label: <Link to="/users">用户管理</Link> });
       baseItems.push({ key: '/inbox-admin', icon: <NotificationOutlined />, label: <Link to="/inbox-admin">站内信配置</Link> });
+      if (enableAdminIpBlacklist) {
+        baseItems.push({ key: '/ip-blacklist', icon: <StopOutlined />, label: <Link to="/ip-blacklist">黑名单管理</Link> });
+      }
+      if (enableAdminEnterpriseAuth) {
+        baseItems.push({ key: '/enterprise-authorization', icon: <BuildOutlined />, label: <Link to="/enterprise-authorization">企业定制开通</Link> });
+      }
     }
     return baseItems;
-  }, [enableTroubleshoot, isAdmin]);
+  }, [enableTroubleshoot, isAdmin, enableAdminIpBlacklist, enableAdminEnterpriseAuth]);
 
   if (!authReady) {
     return null;
@@ -270,6 +287,8 @@ export default function App() {
             {enableTroubleshoot && isAdmin ? <Route path="/troubleshoot" element={<TroubleshootPage />} /> : <Route path="/troubleshoot" element={<Navigate to="/dashboard" replace />} />}
             {isAdmin ? <Route path="/users" element={<UserManagementPage />} /> : <Route path="/users" element={<Navigate to="/dashboard" replace />} />}
             {isAdmin ? <Route path="/inbox-admin" element={<InboxAdminPage />} /> : <Route path="/inbox-admin" element={<Navigate to="/dashboard" replace />} />}
+            {isAdmin && enableAdminIpBlacklist ? <Route path="/ip-blacklist" element={<IpBlacklistPage />} /> : <Route path="/ip-blacklist" element={<Navigate to="/dashboard" replace />} />}
+            {isAdmin && enableAdminEnterpriseAuth ? <Route path="/enterprise-authorization" element={<EnterpriseAuthorizationPage />} /> : <Route path="/enterprise-authorization" element={<Navigate to="/dashboard" replace />} />}
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
         </Content>

@@ -181,7 +181,7 @@ export default function RobotInfoPage() {
   )[0];
   const lastLoginIp = latestOnlineInfo?.ip || detail?.ip || detail?.lastLoginIp || '-';
   const versionSuffix = versionLatest
-    ? `(${versionLatest?.appVersion || '-'}/${versionLatest?.workVersion || '-'}/${versionLatest?.appName || '-'})`
+    ? ` (${versionLatest?.appName || '-'}: ${versionLatest?.appVersion || '-'} APP版本: ${versionLatest?.workVersion || '-'})`
     : '';
   const loginFlapStats = useMemo(() => {
     const now = Date.now();

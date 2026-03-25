@@ -10,6 +10,7 @@ const OPENAI_BASE_OPTIONS = [
   { label: '火山引擎', value: 'https://ark.cn-beijing.volces.com/api/v3/chat/completions' },
   { label: '自定义（OpenAI兼容接口）', value: '__custom__' }
 ];
+const OPENCLAW_WEBHOOK_HINT = 'http://{你的外网ip:18799}/wechat/webhook?robotId={你的机器人id}';
 
 export default function AIHubPage() {
   const [items, setItems] = useState<Provider[]>([]);
@@ -20,6 +21,30 @@ export default function AIHubPage() {
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form] = Form.useForm();
+
+  const normalizeProviderPayload = (rawValues: any, isEditing: boolean) => {
+    const values = { ...rawValues };
+    if (values.provider_type === 'openai') {
+      if (values.base_url_preset && values.base_url_preset !== '__custom__') {
+        values.base_url = values.base_url_preset;
+      } else {
+        values.base_url = values.base_url_openai;
+      }
+    } else {
+      values.base_url = values.base_url_openclaw;
+    }
+    delete values.base_url_preset;
+    delete values.base_url_openai;
+    delete values.base_url_openclaw;
+    values.auth_scheme = values.provider_type === 'openclaw' ? 'x-openclaw-token' : 'bearer';
+    if (!values.api_token) {
+      values.api_token = '';
+    }
+    if (isEditing && !values.api_token) {
+      delete values.api_token;
+    }
+    return values;
+  };
 
   const load = async () => {
     try {
@@ -37,16 +62,9 @@ export default function AIHubPage() {
   const submit = async () => {
     try {
       setSaving(true);
-      const values = await form.validateFields();
-      if (values.provider_type === 'openai' && values.base_url_preset && values.base_url_preset !== '__custom__') {
-        values.base_url = values.base_url_preset;
-      }
-      delete values.base_url_preset;
-      values.auth_scheme = values.provider_type === 'openclaw' ? 'x-openclaw-token' : 'bearer';
+      const rawValues = await form.validateFields();
+      const values = normalizeProviderPayload(rawValues, Boolean(editing));
       if (editing) {
-        if (!values.api_token) {
-          delete values.api_token;
-        }
         await api.updateProvider(editing.id, values);
         message.success('AI回复引擎更新成功');
       } else {
@@ -64,17 +82,10 @@ export default function AIHubPage() {
 
   const onTestProvider = async () => {
     try {
-      const values = await form.validateFields();
-      if (values.provider_type === 'openai' && values.base_url_preset && values.base_url_preset !== '__custom__') {
-        values.base_url = values.base_url_preset;
-      }
-      delete values.base_url_preset;
-      values.auth_scheme = values.provider_type === 'openclaw' ? 'x-openclaw-token' : 'bearer';
+      const rawValues = await form.validateFields();
+      const values = normalizeProviderPayload(rawValues, Boolean(editing));
       if (editing) {
         values.provider_id = editing.id;
-        if (!values.api_token) {
-          delete values.api_token;
-        }
       }
       setTesting(true);
       const res = await api.providerTest(values);
@@ -109,9 +120,9 @@ export default function AIHubPage() {
   const tokenHelp = (
     <Space direction="vertical" size={4}>
       <div>这是啥：你的模型访问凭证。</div>
-      <div>为什么填：没有 Token，模型服务会拒绝请求。</div>
-      <div>怎么填：去对应模型平台复制后粘贴。</div>
-      <div>示例：仅你自己的模型密钥，不会明文展示</div>
+      <div>为什么填：部分平台需要，部分平台可留空。</div>
+      <div>怎么填：去对应模型平台复制后粘贴；不需要可留空。</div>
+      <div>示例：仅你自己的模型密钥，不会明文展示。</div>
     </Space>
   );
 
@@ -141,7 +152,8 @@ export default function AIHubPage() {
           enabled: true,
           provider_type: 'openai',
           base_url_preset: OPENAI_BASE_OPTIONS[0].value,
-          base_url: OPENAI_BASE_OPTIONS[0].value
+          base_url_openai: OPENAI_BASE_OPTIONS[0].value,
+          base_url_openclaw: ''
         });
         setOpen(true);
       }}>新增 AI回复引擎</Button>}
@@ -181,7 +193,8 @@ export default function AIHubPage() {
                       setUseCustomOpenaiUrl(custom);
                       form.setFieldsValue({
                         name: row.name,
-                        base_url: row.base_url,
+                        base_url_openai: row.base_url,
+                        base_url_openclaw: row.base_url,
                         base_url_preset: preset ? preset.value : '__custom__',
                         model: row.model,
                         provider_type: nextType,
@@ -240,7 +253,7 @@ export default function AIHubPage() {
               onChange={(v: 'openai' | 'openclaw') => {
                 setProviderType(v);
                 if (v === 'openai') {
-                  const current = form.getFieldValue('base_url') || '';
+                  const current = form.getFieldValue('base_url_openai') || '';
                   const preset = OPENAI_BASE_OPTIONS.find((x) => x.value === current);
                   if (preset) {
                     setUseCustomOpenaiUrl(false);
@@ -250,7 +263,7 @@ export default function AIHubPage() {
                     form.setFieldsValue({ base_url_preset: '__custom__' });
                   } else {
                     setUseCustomOpenaiUrl(false);
-                    form.setFieldsValue({ base_url_preset: OPENAI_BASE_OPTIONS[0].value, base_url: OPENAI_BASE_OPTIONS[0].value });
+                    form.setFieldsValue({ base_url_preset: OPENAI_BASE_OPTIONS[0].value, base_url_openai: OPENAI_BASE_OPTIONS[0].value });
                   }
                 }
               }}
@@ -279,19 +292,19 @@ export default function AIHubPage() {
                   onChange={(v: string) => {
                     if (v === '__custom__') {
                       setUseCustomOpenaiUrl(true);
-                      if (!form.getFieldValue('base_url')) {
-                        form.setFieldsValue({ base_url: 'https://' });
+                      if (!form.getFieldValue('base_url_openai')) {
+                        form.setFieldsValue({ base_url_openai: 'https://' });
                       }
                       return;
                     }
                     setUseCustomOpenaiUrl(false);
-                    form.setFieldsValue({ base_url: v });
+                    form.setFieldsValue({ base_url_openai: v });
                   }}
                 />
               </Form.Item>
               {useCustomOpenaiUrl ? (
                 <Form.Item
-                  name="base_url"
+                  name="base_url_openai"
                   label={(
                     <Space size={6}>
                       <span>手动 Base URL</span>
@@ -308,7 +321,7 @@ export default function AIHubPage() {
             </>
           ) : (
             <Form.Item
-              name="base_url"
+              name="base_url_openclaw"
               label={(
                 <Space size={6}>
                   <span>Base URL</span>
@@ -319,7 +332,7 @@ export default function AIHubPage() {
               )}
               rules={[{ required: true }]}
             >
-              <Input />
+              <Input placeholder={OPENCLAW_WEBHOOK_HINT} />
             </Form.Item>
           )}
           <Form.Item
@@ -332,30 +345,33 @@ export default function AIHubPage() {
                 </Popover>
               </Space>
             )}
-            rules={editing ? [] : [{ required: true }]}
           >
-            <Input.Password placeholder={editing ? '留空表示不变更' : ''} />
+            <Input.Password placeholder={editing ? '留空表示不变更（也可不填）' : '可选，不需要可留空'} />
           </Form.Item>
-          <Form.Item
-            name="model"
-            label={(
-              <Space size={6}>
-                <span>Model</span>
-                <Popover content={modelHelp} trigger="hover" placement="right">
-                  <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
-                </Popover>
-              </Space>
-            )}
-          >
-            <Input />
-          </Form.Item>
-          <Form.Item
-            name="extra_json"
-            label="扩展 JSON"
-            tooltip='可选，例如 {"request_headers":{"x-openclaw-agent-id":"xxx"},"push_secret":"xxx"}'
-          >
-            <Input.TextArea rows={5} />
-          </Form.Item>
+          {providerType === 'openai' ? (
+            <>
+              <Form.Item
+                name="model"
+                label={(
+                  <Space size={6}>
+                    <span>Model</span>
+                    <Popover content={modelHelp} trigger="hover" placement="right">
+                      <QuestionCircleOutlined style={{ color: '#8c8c8c' }} />
+                    </Popover>
+                  </Space>
+                )}
+              >
+                <Input />
+              </Form.Item>
+              <Form.Item
+                name="extra_json"
+                label="扩展 JSON"
+                tooltip='可选，例如 {"request_headers":{"x-openclaw-agent-id":"xxx"},"push_secret":"xxx"}'
+              >
+                <Input.TextArea rows={5} />
+              </Form.Item>
+            </>
+          ) : null}
           <Form.Item name="enabled" valuePropName="checked" label="启用">
             <Switch />
           </Form.Item>
